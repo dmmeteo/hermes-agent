@@ -14693,8 +14693,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Normalize underscores to hyphens so Telegram's underscored
                 # autocomplete form matches plugin commands registered with
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
+                plugin_command = command.replace("_", "-")
+                plugin_handler = get_plugin_command_handler(plugin_command)
                 if plugin_handler:
+                    # Plugin commands are slash capabilities too, and they run
+                    # arbitrary plugin code in the gateway process. The cold
+                    # gate above resolves access on the name the user *typed*,
+                    # which never matches for the underscored form Telegram's
+                    # command menu sends for a hyphenated plugin command — so
+                    # /my_cmd reached this sink unchecked while /my-cmd was
+                    # denied. Re-check on the normalized name that is actually
+                    # dispatched, mirroring the quick-command sink gate above.
+                    _denied = self._check_slash_access(source, plugin_command)
+                    if _denied is not None:
+                        return _denied
                     user_args = event.get_command_args().strip()
                     # Bind THIS turn's session identity for the duration of the
                     # handler. reset_session_vars() ran at handler entry and
