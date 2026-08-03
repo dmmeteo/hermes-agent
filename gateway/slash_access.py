@@ -53,6 +53,30 @@ _ALWAYS_ALLOWED_FOR_USERS: FrozenSet[str] = frozenset({
 })
 
 
+def _fold_command_name(name: str) -> str:
+    """Canonicalize a slash command name for allowlist comparison.
+
+    ``_`` and ``-`` are interchangeable in slash dispatch, so they must be
+    interchangeable here too. Two independent reasons, both generic:
+
+      - Plugin dispatch normalizes the typed name to hyphens before it looks
+        a handler up (``gateway/run.py``), because Telegram's command menu
+        renders a hyphenated plugin command as ``/my_cmd`` and sends that
+        underscored form back. The gate therefore sees ``my-cmd`` while the
+        operator, copying what the menu showed them, wrote ``my_cmd``.
+      - Several built-ins register both spellings as aliases of one command
+        (``reload-mcp``/``reload_mcp``, ``codex-runtime``/``codex_runtime``),
+        but the gate only ever sees the canonical name — so listing the alias
+        would silently fail to grant the command it names.
+
+    This helper is intentionally used only at dispatch sinks that themselves
+    alias underscores to hyphens (currently plugin commands). Applying it to
+    every slash capability would collapse distinct exact-key quick commands
+    into one authorization identity.
+    """
+    return name.replace("_", "-")
+
+
 @dataclass(frozen=True)
 class SlashAccessPolicy:
     """Resolved access policy for a single (platform, scope) pair.
@@ -76,16 +100,31 @@ class SlashAccessPolicy:
             return False
         return str(user_id) in self.admin_user_ids
 
-    def can_run(self, user_id: Optional[str], canonical_cmd: str) -> bool:
+    def can_run(
+        self,
+        user_id: Optional[str],
+        canonical_cmd: str,
+        *,
+        fold_separators: bool = True,
+    ) -> bool:
         if not self.enabled:
             return True
         if self.is_admin(user_id):
             return True
         if not canonical_cmd:
             return False
-        if canonical_cmd in _ALWAYS_ALLOWED_FOR_USERS:
+        command_name = canonical_cmd.lower()
+        if command_name in _ALWAYS_ALLOWED_FOR_USERS:
             return True
-        return canonical_cmd in self.user_allowed_commands
+        if command_name in self.user_allowed_commands:
+            return True
+        if not fold_separators:
+            return False
+        folded = _fold_command_name(command_name)
+        return any(
+            _fold_command_name(name) == folded
+            for name in self.user_allowed_commands
+        )
 
 
 _DM_CHAT_TYPES = frozenset({"dm", "direct", "private", ""})
@@ -119,7 +158,11 @@ def _coerce_command_list(raw: Any) -> FrozenSet[str]:
 
     Strips leading slashes so YAML can read either ``["help", "status"]``
     or ``["/help", "/status"]``. Lowercase canonicalization matches how
-    ``resolve_command()`` stores names.
+    ``resolve_command()`` stores names. Separator folding is deliberately not
+    done at ingest: user-defined quick commands dispatch by exact key and may
+    legitimately define both ``safe_cmd`` and ``safe-cmd``. Plugin dispatch
+    opts into separator aliasing only after it has resolved a real plugin
+    handler.
     """
     if raw is None:
         return frozenset()

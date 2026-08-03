@@ -16553,7 +16553,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # dispatch sink unchecked. Apply the same admin/user policy to
                 # the raw typed name here so non-admins can't invoke admin-only
                 # quick commands. (#44727)
-                _denied = self._check_slash_access(source, command)
+                _denied = self._check_slash_access(
+                    source, command, fold_separators=False
+                )
                 if _denied is not None:
                     return _denied
                 qcmd = quick_commands[command]
@@ -16606,8 +16608,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Normalize underscores to hyphens so Telegram's underscored
                 # autocomplete form matches plugin commands registered with
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
+                plugin_command = command.replace("_", "-")
+                plugin_handler = get_plugin_command_handler(plugin_command)
                 if plugin_handler:
+                    # Plugin commands are slash capabilities too, and they run
+                    # arbitrary plugin code in the gateway process. The cold
+                    # gate above resolves access on the name the user *typed*,
+                    # which never matches for the underscored form Telegram's
+                    # command menu sends for a hyphenated plugin command — so
+                    # /my_cmd reached this sink unchecked while /my-cmd was
+                    # denied. Re-check on the normalized name that is actually
+                    # dispatched, mirroring the quick-command sink gate above.
+                    _denied = self._check_slash_access(
+                        source, plugin_command, fold_separators=True
+                    )
+                    if _denied is not None:
+                        return _denied
                     user_args = event.get_command_args().strip()
                     # Bind THIS turn's session identity for the duration of the
                     # handler. reset_session_vars() ran at handler entry and
@@ -19874,7 +19890,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
     def _check_slash_access(
-        self, source: SessionSource, canonical_cmd: str
+        self,
+        source: SessionSource,
+        canonical_cmd: str,
+        *,
+        fold_separators: bool = True,
     ) -> Optional[str]:
         """Return a denial message if ``source`` cannot run ``canonical_cmd``,
         else None. Used by both the cold and running-agent dispatch paths
@@ -19891,7 +19911,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not canonical_cmd:
             return None
         policy = _policy_for_source(self.config, source)
-        if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
+        if not policy.enabled or policy.can_run(
+            source.user_id,
+            canonical_cmd,
+            fold_separators=fold_separators,
+        ):
             return None
         logger.info(
             "Slash command /%s denied for %s:%s (not admin, not in user_allowed_commands)",
