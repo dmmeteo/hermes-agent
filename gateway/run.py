@@ -16609,9 +16609,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
-                    if asyncio.iscoroutine(result):
-                        result = await result
+                    # Bind THIS turn's session identity for the duration of the
+                    # handler. reset_session_vars() ran at handler entry and
+                    # _set_session_env() doesn't run until the agent path, so
+                    # without this a handler's get_session_env() finds every
+                    # var unset and falls back to process-global os.environ —
+                    # last-writer-wins across concurrent gateway sessions, i.e.
+                    # a plugin command reads some *other* platform's origin.
+                    # The handler gets no event/source argument, so the bound
+                    # context is its only authoritative view of the origin.
+                    _plugin_env_tokens = self._set_session_env_from_source(
+                        source, _quick_key
+                    )
+                    try:
+                        result = plugin_handler(user_args)
+                        if asyncio.iscoroutine(result):
+                            result = await result
+                    finally:
+                        self._clear_session_env(_plugin_env_tokens)
                     return str(result) if result else None
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
@@ -22897,6 +22912,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns a list of reset tokens; pass them to ``_clear_session_env``
         in a ``finally`` block.
         """
+        return self._set_session_env_from_source(context.source, context.session_key)
+
+    def _set_session_env_from_source(
+        self, source: SessionSource, session_key: str
+    ) -> list:
+        """Bind session context variables from a raw source + session key.
+
+        Same contract as :meth:`_set_session_env`, but usable from dispatch
+        paths that have the real ``SessionSource`` in hand before a
+        ``SessionContext`` is built (plugin slash commands).
+        """
         from gateway.session_context import set_session_vars
         # Propagate the adapter's async-delivery capability so async tools
         # (terminal notify_on_complete / watch_patterns, delegate_task
@@ -22906,23 +22932,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # bare runners built via object.__new__ (tests) without self.adapters
         # don't blow up — they simply default to supported.
         _adapters = getattr(self, "adapters", None) or {}
-        _adapter = _adapters.get(context.source.platform)
+        _adapter = _adapters.get(source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
         return set_session_vars(
-            platform=context.source.platform.value,
-            chat_id=context.source.chat_id,
-            chat_type=(
-                str(context.source.chat_type) if context.source.chat_type else ""
-            ),
-            chat_name=context.source.chat_name or "",
-            thread_id=str(context.source.thread_id) if context.source.thread_id else "",
-            user_id=str(context.source.user_id) if context.source.user_id else "",
-            user_id_alt=str(context.source.user_id_alt) if context.source.user_id_alt else "",
-            user_name=str(context.source.user_name) if context.source.user_name else "",
-            scope_id=str(getattr(context.source, "scope_id", "") or ""),
-            session_key=context.session_key,
-            message_id=str(context.source.message_id) if context.source.message_id else "",
-            profile=getattr(context.source, "profile", "") or "",
+            platform=source.platform.value,
+            chat_id=source.chat_id,
+            chat_type=str(source.chat_type) if source.chat_type else "",
+            chat_name=source.chat_name or "",
+            thread_id=str(source.thread_id) if source.thread_id else "",
+            user_id=str(source.user_id) if source.user_id else "",
+            user_id_alt=str(source.user_id_alt) if source.user_id_alt else "",
+            user_name=str(source.user_name) if source.user_name else "",
+            scope_id=str(getattr(source, "scope_id", "") or ""),
+            session_key=session_key,
+            message_id=str(source.message_id) if source.message_id else "",
+            profile=getattr(source, "profile", "") or "",
             async_delivery=_async_delivery,
             cron_session="",
         )
