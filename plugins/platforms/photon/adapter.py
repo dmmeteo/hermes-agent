@@ -464,6 +464,12 @@ def _sidecar_deps_stale() -> bool:
     lockfile is newer than that marker, the install is out of date. This is the
     same signal ``npm ci`` uses. Returns False (do nothing) if either file is
     missing or unreadable, so a first-run or odd filesystem never blocks start.
+
+    ``gateway.sidecar_runtime.deps_are_current`` reads the same two files with
+    the OPPOSITE missing-file answer: the resolver treats a missing marker as
+    "install needed" and mirrors, this adapter treats it as "nothing to do"
+    because ``sidecar_deps_installed`` owns the missing case. Keep that
+    difference if you merge them.
     """
     lockfile = _sidecar_dir() / "package-lock.json"
     marker = _sidecar_dir() / "node_modules" / ".package-lock.json"
