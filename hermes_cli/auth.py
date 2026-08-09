@@ -46,10 +46,15 @@ import httpx
 from hermes_cli.config import (
     get_hermes_home,
     get_config_path,
+    load_config,
     read_raw_config,
     require_readable_config_before_write,
 )
-from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
+from hermes_constants import (
+    OPENROUTER_BASE_URL,
+    iter_hermes_node_dirs,
+    secure_parent_dir,
+)
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
 
@@ -96,6 +101,11 @@ MINIMAX_OAUTH_REFRESH_SKEW_SECONDS = 60
 DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
+DEFAULT_CLAUDE_CODE_ACP_BASE_URL = "acp://claude-code"
+# Pinned Claude Code ACP adapter. Single source of truth for the install hint
+# and the version the runtime is validated against (see
+# docs/development/claude-code-acp-runtime-plan.md).
+CLAUDE_CODE_ACP_PACKAGE = "@agentclientprotocol/claude-agent-acp@0.66.0"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 DEFAULT_ACTUAL_BASE_URL = "https://api.actual.inc/v1"
 DEFAULT_ACTUAL_LOCAL_BASE_URL = "http://127.0.0.1:8080/v1"
@@ -266,6 +276,51 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+        extra={
+            "command_env_vars": ("HERMES_COPILOT_ACP_COMMAND", "COPILOT_CLI_PATH"),
+            "default_command": "copilot",
+            "args_env_var": "HERMES_COPILOT_ACP_ARGS",
+            "default_args": ("--acp", "--stdio"),
+            "remote_url_prefixes": ("acp+tcp://",),
+            "missing_message": (
+                "Could not find the Copilot CLI command '{command}'. "
+                "Install GitHub Copilot CLI or set "
+                "HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+            ),
+            "missing_code": "missing_copilot_cli",
+        },
+    ),
+    # Claude Code, driven over the Agent Client Protocol. The adapter is a
+    # Node binary (`claude-agent-acp`) that hosts a real Claude Code session
+    # and authenticates with the user's existing Claude subscription — no API
+    # key is involved, which is why there are no api_key_env_vars here.
+    "claude-code-acp": ProviderConfig(
+        id="claude-code-acp",
+        name="Claude Code",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_CLAUDE_CODE_ACP_BASE_URL,
+        base_url_env_var="CLAUDE_CODE_ACP_BASE_URL",
+        extra={
+            "command_env_vars": ("HERMES_CLAUDE_ACP_COMMAND",),
+            "default_command": "claude-agent-acp",
+            "args_env_var": "HERMES_CLAUDE_ACP_ARGS",
+            # The adapter takes no arguments. Explicitly empty — presence-based
+            # lookup keeps copilot's `--acp --stdio` from leaking in here.
+            "default_args": (),
+            # No remote-socket mode: the adapter is always a local subprocess.
+            "remote_url_prefixes": (),
+            # Canonical, user-facing place to pin the binary.
+            "config_path": ("model", "claude_code_acp"),
+            # Found even when $HERMES_HOME/node is not on PATH.
+            "managed_node_command": "claude-agent-acp",
+            "missing_message": (
+                "Could not find the Claude Code ACP adapter '{command}'. "
+                "Run `hermes model` and pick Claude Code to install it into "
+                "the Hermes-managed Node prefix, or set "
+                "model.claude_code_acp.command in config.yaml."
+            ),
+            "missing_code": "missing_claude_acp_adapter",
+        },
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -7000,33 +7055,175 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+# Every key an external-process provider must declare. Deliberately has no
+# defaults: a new provider that forgets one must fail loudly rather than
+# silently inherit copilot's binary name, env vars, and error code.
+_EXTERNAL_PROCESS_SPEC_KEYS = (
+    "command_env_vars",
+    "default_command",
+    "args_env_var",
+    "default_args",
+    "remote_url_prefixes",
+    "missing_message",
+    "missing_code",
+)
+
+
+def _external_process_spec(pconfig: "ProviderConfig") -> Dict[str, Any]:
+    """Command-resolution spec for an external-process provider.
+
+    Table-driven off ``ProviderConfig.extra`` so each subprocess-backed
+    provider declares its own binary, args, and missing-binary guidance
+    instead of the resolver growing a per-provider ladder.
+
+    Lookups are **presence-based**, not truthiness-based: an explicitly empty
+    ``default_args=()`` means "this binary takes no arguments" and must not
+    fall back to another provider's flags.
+    """
+    extra = pconfig.extra or {}
+    missing = [key for key in _EXTERNAL_PROCESS_SPEC_KEYS if key not in extra]
+    if missing:
+        raise ValueError(
+            f"external-process provider {pconfig.id!r} is missing required "
+            f"spec keys in ProviderConfig.extra: {', '.join(missing)}"
+        )
+    return {
+        "command_env_vars": tuple(extra["command_env_vars"]),
+        "default_command": extra["default_command"],
+        "args_env_var": extra["args_env_var"],
+        "default_args": list(extra["default_args"]),
+        "remote_url_prefixes": tuple(extra["remote_url_prefixes"]),
+        "missing_message": extra["missing_message"],
+        "missing_code": extra["missing_code"],
+        # Optional: dotted config path whose value overrides the command, and
+        # whether a Hermes-managed Node install should be searched.
+        "config_path": tuple(extra.get("config_path") or ()),
+        "managed_node_command": extra.get("managed_node_command", ""),
+    }
+
+
+def _external_process_config_override(spec: Dict[str, Any]) -> tuple[str, list]:
+    """Read ``command``/``args`` from config.yaml for this provider.
+
+    Config is the canonical, user-facing place to pin the binary (AGENTS.md:
+    non-secret settings live in config.yaml, never a new env var). Any failure
+    reading config degrades to "no override" — a broken config must not make
+    provider resolution explode.
+    """
+    path = spec.get("config_path") or ()
+    if not path:
+        return "", []
+    try:
+        node: Any = load_config()
+        for key in path:
+            if not isinstance(node, dict):
+                return "", []
+            node = node.get(key)
+        if not isinstance(node, dict):
+            return "", []
+        command = str(node.get("command") or "").strip()
+        raw_args = node.get("args")
+        args = [str(a) for a in raw_args] if isinstance(raw_args, (list, tuple)) else []
+        return command, args
+    except Exception:
+        logger.debug("config override lookup failed", exc_info=True)
+        return "", []
+
+
+def _resolve_external_process_command(
+    pconfig: "ProviderConfig",
+) -> tuple[str, list, str, Optional[str], Dict[str, Any]]:
+    """Return ``(command, args, base_url, resolved_command, spec)``.
+
+    Precedence: env var (testing bridge) → config.yaml → declared default.
+    """
+    spec = _external_process_spec(pconfig)
+
+    command = ""
+    for env_var in spec["command_env_vars"]:
+        command = os.getenv(env_var, "").strip()
+        if command:
+            break
+
+    config_command, config_args = _external_process_config_override(spec)
+    if not command:
+        command = config_command
+    if not command:
+        command = spec["default_command"]
+
+    raw_args = os.getenv(spec["args_env_var"], "").strip() if spec["args_env_var"] else ""
+    if raw_args:
+        args = shlex.split(raw_args)
+    elif config_args:
+        args = list(config_args)
+    else:
+        args = list(spec["default_args"])
+
+    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
+    if not base_url:
+        base_url = pconfig.inference_base_url
+
+    resolved_command = shutil.which(command) if command else None
+    if not resolved_command and spec.get("managed_node_command"):
+        resolved_command = _find_in_managed_node_dirs(spec["managed_node_command"])
+    return command, args, base_url, resolved_command, spec
+
+
+def _find_in_managed_node_dirs(name: str) -> Optional[str]:
+    """Locate *name* inside the Hermes-managed Node directories.
+
+    A plain directory scan on purpose. ``find_node_executable`` is for Node's
+    own tooling: it runs ``<path> --version`` and, on failure, can trigger a
+    full re-download of the managed Node tree. That is far too much for a
+    provider *status* check, which is reachable from ``hermes doctor``, the
+    dashboard, and ``get_auth_status``. A third-party adapter that lacks
+    ``--version`` would also be reported "not installed" while sitting right
+    there on disk.
+
+    ``shutil.which`` with an explicit ``path`` keeps Windows PATHEXT handling
+    (so the ``.cmd`` shim npm writes is found) without any subprocess.
+    """
+    try:
+        for directory in iter_hermes_node_dirs():
+            if not directory.is_dir():
+                continue
+            found = shutil.which(name, path=str(directory))
+            if found:
+                return found
+    except Exception:
+        logger.debug("managed node scan failed", exc_info=True)
+    return None
+
+
+def _external_process_reachable(
+    base_url: str, resolved_command: Optional[str], spec: Dict[str, Any]
+) -> bool:
+    """True when the provider can actually be driven — a local binary was
+    found, or the base URL points at a remote agent socket."""
+    if resolved_command:
+        return True
+    return any(base_url.startswith(prefix) for prefix in spec["remote_url_prefixes"])
+
+
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for providers that run a local subprocess."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
+    command, args, base_url, resolved_command, spec = _resolve_external_process_command(
+        pconfig
     )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-    if not base_url:
-        base_url = pconfig.inference_base_url
-
-    resolved_command = shutil.which(command) if command else None
+    reachable = _external_process_reachable(base_url, resolved_command, spec)
     return {
-        "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "configured": reachable,
         "provider": provider_id,
         "name": pconfig.name,
         "command": command,
         "args": args,
         "resolved_command": resolved_command,
         "base_url": base_url,
-        "logged_in": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "logged_in": reachable,
     }
 
 
@@ -7047,7 +7244,7 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
-    if target == "copilot-acp":
+    if target in {"copilot-acp", "claude-code-acp"}:
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
@@ -7233,29 +7430,19 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             code="invalid_provider",
         )
 
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-    if not base_url:
-        base_url = pconfig.inference_base_url
-
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
+    command, args, base_url, resolved_command, spec = _resolve_external_process_command(
+        pconfig
     )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    resolved_command = shutil.which(command) if command else None
-    if not resolved_command and not base_url.startswith("acp+tcp://"):
+    if not _external_process_reachable(base_url, resolved_command, spec):
         raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            spec["missing_message"].format(command=command),
             provider=provider_id,
-            code="missing_copilot_cli",
+            code=spec["missing_code"],
         )
 
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        "api_key": provider_id,
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,

@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
+import sys
 import urllib.parse
 
 from hermes_cli.config import clear_model_endpoint_credentials
@@ -2022,6 +2023,81 @@ def _model_flow_copilot_acp(config, current_model=""):
     deactivate_provider()
 
     print(f"Default model set to: {selected} (via {pconfig.name})")
+
+def _model_flow_claude_code_acp(config, current_model=""):
+    """Claude Code flow — presence check, managed install, persist the choice.
+
+    Claude Code drives its own model, so there is nothing to pick: the flow's
+    job is to make sure the adapter exists and to persist provider + model so
+    the next `hermes` run routes through the ACP runtime.
+    """
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
+        _save_model_choice,
+        deactivate_provider,
+        get_external_process_provider_status,
+    )
+    from hermes_cli.config import (
+        clear_model_endpoint_credentials,
+        load_config,
+        save_config,
+    )
+
+    del config, current_model
+
+    provider_id = "claude-code-acp"
+    model_id = "claude-code"
+    pconfig = PROVIDER_REGISTRY[provider_id]
+
+    status = get_external_process_provider_status(provider_id)
+    print("  Claude Code runs as a local agent process and uses the Claude")
+    print("  subscription you are already signed in to — no API key is used.")
+    print()
+
+    if not status.get("configured"):
+        from hermes_cli.claude_acp_install import install_adapter
+
+        print(f"  ⚠ Adapter '{status.get('command')}' was not found.")
+        # Never block on stdin when there is no terminal (setup scripts, CI,
+        # captured test runs) — print the remedy and leave config untouched.
+        answer = "n"
+        if sys.stdin is not None and sys.stdin.isatty():
+            answer = input(
+                "  Install it into the Hermes-managed Node prefix now? [Y/n] "
+            ).strip().lower()
+        if answer in ("", "y", "yes"):
+            ok, detail = install_adapter()
+            if not ok:
+                print(f"  ✗ {detail}")
+                print("  Nothing was saved. Re-run `hermes model` once the adapter is available.")
+                return
+            print(f"  ✓ Installed: {detail}")
+            status = get_external_process_provider_status(provider_id)
+        else:
+            print("  Nothing was saved. Set model.claude_code_acp.command in")
+            print("  config.yaml if the adapter lives somewhere custom.")
+            return
+
+    print(f"  Adapter: {status.get('resolved_command') or status.get('command')}")
+    print(f"  Backend marker: {status.get('base_url') or pconfig.inference_base_url}")
+    print()
+
+    _save_model_choice(model_id)
+
+    cfg = load_config()
+    model = cfg.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+        cfg["model"] = model
+    model["provider"] = provider_id
+    model["base_url"] = status.get("base_url") or pconfig.inference_base_url
+    model["api_mode"] = "claude_code_acp"
+    clear_model_endpoint_credentials(model, clear_api_mode=False)
+    save_config(cfg)
+    deactivate_provider()
+
+    print(f"Default model set to: {model_id} (via {pconfig.name})")
+
 
 def _model_flow_kimi(config, current_model=""):
     """Kimi / Moonshot model selection with automatic endpoint routing.

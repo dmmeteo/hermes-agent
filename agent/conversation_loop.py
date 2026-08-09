@@ -1631,6 +1631,19 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
+    # Same delegated-runtime seam for Claude Code: the turn is handed to a
+    # `claude-agent-acp` subprocess which owns the model loop and the native
+    # tools. See agent/claude_code_runtime.py and
+    # docs/development/claude-code-acp-runtime-plan.md.
+    if agent.api_mode == "claude_code_acp":
+        return agent._run_claude_code_acp_turn(
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=_should_review_memory,
+        )
+
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:

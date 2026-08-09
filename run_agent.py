@@ -3154,6 +3154,21 @@ class AIAgent:
                 _admit_hard_cancel()
             self._pending_redirect = None
 
+        # The Claude Code ACP runtime owns its model/tool loop inside the
+        # adapter subprocess, so a Hermes thread flag cannot reach it.
+        # Cancellation is a protocol verb: notify session/cancel and let the
+        # in-flight session/prompt settle as stopReason="cancelled".
+        if getattr(self, "api_mode", None) == "claude_code_acp":
+            _acp_turn = getattr(self, "_claude_acp_turn", None)
+            _request_cancel = getattr(_acp_turn, "request_cancel", None)
+            if callable(_request_cancel):
+                try:
+                    _request_cancel()
+                except Exception:
+                    logger.debug(
+                        "Failed to cancel Claude Code ACP turn", exc_info=True
+                    )
+
         # Codex app-server owns its model/tool loop and watches a private
         # interrupt event rather than Hermes' per-thread flag.
         if getattr(self, "api_mode", None) == "codex_app_server":
@@ -8082,6 +8097,19 @@ class AIAgent:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
         return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
+
+    def _run_claude_code_acp_turn(
+        self,
+        *,
+        user_message: str,
+        original_user_message: Any,
+        messages: List[Dict[str, Any]],
+        effective_task_id: str,
+        should_review_memory: bool = False,
+    ) -> Dict[str, Any]:
+        """Forwarder — see ``agent.claude_code_runtime.run_claude_code_acp_turn``."""
+        from agent.claude_code_runtime import run_claude_code_acp_turn
+        return run_claude_code_acp_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
 
 def main(
     query: str = None,

@@ -2025,6 +2025,22 @@ def resolve_runtime_provider(
                 "requested_provider": requested_provider,
             }
 
+    if provider == "claude-code-acp":
+        # Delegated runtime: the whole turn is handed to a Claude Code session
+        # over ACP, so there is no REST endpoint and no API key. `command` /
+        # `args` flow through to AIAgent.acp_command / acp_args.
+        creds = resolve_external_process_provider_credentials(provider)
+        return {
+            "provider": "claude-code-acp",
+            "api_mode": "claude_code_acp",
+            "base_url": creds.get("base_url", "").rstrip("/"),
+            "api_key": creds.get("api_key", ""),
+            "command": creds.get("command", ""),
+            "args": list(creds.get("args") or []),
+            "source": creds.get("source", "process"),
+            "requested_provider": requested_provider,
+        }
+
     if provider == "copilot-acp":
         creds = resolve_external_process_provider_credentials(provider)
         return {
