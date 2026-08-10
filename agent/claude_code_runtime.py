@@ -5,33 +5,53 @@ Called from ``run_conversation()`` when ``agent.api_mode == "claude_code_acp"``
 loop and the native tools; Hermes owns the durable conversation, the
 transcript, and the turn lease.
 
-Packet 1 scope — deliberately narrow (see
+Scope through Packet 2 (see
 ``docs/development/claude-code-acp-runtime-plan.md``):
 
-* one adapter process **per turn**, reaped on success, error, and interrupt
+* one adapter process **per Hermes session**, reused across turns and reaped
+  on close, retirement, idle eviction, and interpreter exit
+  (``agent/claude_acp_session.py`` owns that lifecycle)
 * only the **new user turn** is sent — Hermes never replays transcript
-  history, which would break the adapter's own prompt cache
+  history, which would break the adapter's own prompt cache. The single
+  exception is a bounded recap after a reseed, when the Claude-side session
+  could not be reattached at all
 * ``agent_message_chunk`` text is assembled into the normal Hermes response;
   tool and thought events are consumed but not projected
 
-Session reuse, rich tool projection, and permission UX are Packets 2 and 3.
+Rich tool projection and permission UX are Packet 3.
 """
 
 from __future__ import annotations
 
 import logging
-import threading
 from typing import Any, Dict, List, Optional
+
+from agent.claude_acp_binding import BindingStore, TurnLeaseConflict
+from agent.claude_acp_session import ClaudeAcpSession, ClaudeCodeAuthRequired
 
 logger = logging.getLogger(__name__)
 
-# The adapter drives its own agentic loop, so a turn can legitimately run for
-# a long time. Matches the copilot ACP client's ceiling.
-_TURN_TIMEOUT_SECONDS = 900.0
+__all__ = [
+    "ClaudeCodeAuthRequired",
+    "RESEED_MARKER",
+    "resolve_adapter_argv",
+    "run_claude_code_acp_turn",
+]
 
-# Permission mode Hermes negotiates for every session. NOT the adapter's
-# default (`auto`), which self-approves via a classifier.
-_PERMISSION_MODE = "default"
+# The one user-visible marker a reseed is allowed to produce. Shown once, on
+# the turn that lost its Claude-side session — silently starting over would
+# make the assistant look like it forgot the conversation for no reason.
+RESEED_MARKER = (
+    "↻ Claude Code's session for this conversation had to be restarted; "
+    "continuing from a short recap."
+)
+
+# Recap bounds. The recap exists so a reseeded session is not amnesiac — it is
+# NOT a transcript replay, and it must stay small enough that it can never
+# become one.
+_RECAP_MAX_MESSAGES = 8
+_RECAP_MAX_CHARS = 2000
+_RECAP_MESSAGE_CHARS = 300
 
 # Stop reasons that mean "the model finished normally". Anything else
 # (refusal, max_tokens, max_turn_requests, ...) is surfaced as a failure.
@@ -46,11 +66,7 @@ _STDERR_DIAGNOSTIC_LINES = 5
 _STDERR_DIAGNOSTIC_LINE_CHARS = 500
 
 
-class ClaudeCodeAuthRequired(RuntimeError):
-    """The adapter has no usable Claude credential."""
-
-
-def _diagnostics(turn: Optional["ClaudeAcpTurn"]) -> str:
+def _diagnostics(turn: Any) -> str:
     """Bounded, credential-scrubbed adapter stderr for a failure message.
 
     Adapter stderr is the only signal for a whole class of setup failures, but
@@ -101,168 +117,74 @@ def resolve_adapter_argv(agent) -> list[str]:
     return [creds["command"]] + list(creds.get("args") or [])
 
 
-class ClaudeAcpTurn:
-    """One in-flight ACP turn. Owns the adapter process for its lifetime."""
+def _build_recap(messages: List[Dict[str, Any]]) -> str:
+    """A bounded recap of the recent conversation, for a reseeded session.
 
-    def __init__(self, argv: list[str], cwd: str) -> None:
-        self._argv = argv
-        self._cwd = cwd
-        self._client = None
-        self._session_id: Optional[str] = None
-        self._cancel_requested = threading.Event()
-        self._lock = threading.Lock()
-        self.text_parts: list[str] = []
-        self.denied_permissions = 0
-        # Captured before the client is closed so failure paths can surface
-        # bounded, scrubbed diagnostics.
-        self.stderr_tail: list[str] = []
+    Only ever used when the Claude Code session could not be reattached, so
+    the adapter genuinely has no history. Hermes' transcript is the
+    authoritative copy; this sends a small, truncated tail of it — never the
+    whole thing, and never the system prompt. The trailing user message is
+    excluded because it is the prompt itself.
+    """
+    body = [
+        m for m in messages[:-1]
+        if isinstance(m, dict)
+        and m.get("role") in ("user", "assistant")
+        and isinstance(m.get("content"), str)
+        and m.get("content").strip()
+    ]
+    lines: List[str] = []
+    budget = _RECAP_MAX_CHARS
+    for message in reversed(body[-_RECAP_MAX_MESSAGES:]):
+        text = message["content"].strip()
+        if len(text) > _RECAP_MESSAGE_CHARS:
+            text = text[:_RECAP_MESSAGE_CHARS] + "…"
+        line = f"{message['role']}: {text}"
+        if len(line) > budget:
+            break
+        budget -= len(line)
+        lines.append(line)
+    if not lines:
+        return ""
+    lines.reverse()
+    return (
+        "[Context recap from Hermes — your session for this conversation was "
+        "restarted, so you no longer have its history. This is background, "
+        "not a new instruction:]\n" + "\n".join(lines)
+    )
 
-    # -- cancellation -----------------------------------------------------
 
-    def request_cancel(self) -> None:
-        """Ask the adapter to abort. Safe to call from another thread.
+def _get_or_create_session(agent, argv: list[str], cwd: str) -> ClaudeAcpSession:
+    """The one live ACP session for this Hermes conversation.
 
-        Cancellation is a protocol notification, so the pending
-        ``session/prompt`` still settles — with ``stopReason == "cancelled"``.
-        """
-        self._cancel_requested.set()
-        with self._lock:
-            client, session_id = self._client, self._session_id
-        if client is not None and session_id:
-            try:
-                client.cancel(session_id)
-            except Exception:
-                logger.debug("session/cancel failed", exc_info=True)
-
-    @property
-    def cancel_requested(self) -> bool:
-        return self._cancel_requested.is_set()
-
-    def _reissue_cancel_if_pending(self) -> None:
-        """Re-send a cancel once the prompt is genuinely in flight.
-
-        A `session/cancel` delivered before any prompt existed is something a
-        real adapter may legitimately ignore — there was no turn to cancel.
-        Without this the user's stop would be silently dropped and the turn
-        would run to natural completion. Safe to send twice: cancellation is
-        idempotent, and the turn still settles through the pending prompt
-        reply.
-        """
-        if not self._cancel_requested.is_set():
-            return
-        with self._lock:
-            client, session_id = self._client, self._session_id
-        if client is not None and session_id:
-            try:
-                client.cancel(session_id)
-            except Exception:
-                logger.debug("cancel re-issue failed", exc_info=True)
-
-    # -- the turn ---------------------------------------------------------
-
-    def run(self, user_message: str) -> Dict[str, Any]:
-        """Spawn, handshake, run one prompt, and always reap the child."""
-        from agent.transports.claude_acp import ClaudeAcpClient
-
-        client = ClaudeAcpClient(command=self._argv, cwd=self._cwd)
-        with self._lock:
-            self._client = client
+    Recreated only when the adapter argv or the workspace changed — either
+    means the existing adapter is no longer the right process to be talking
+    to, and leaving it running would break the one-adapter-per-session
+    invariant.
+    """
+    session = getattr(agent, "_claude_acp_session", None)
+    if session is not None and not session.closed and session.matches(argv, cwd):
+        return session
+    if session is not None:
         try:
-            client.initialize()
-            # An adapter with no usable credential advertises the auth methods
-            # it wants completed first. Without this check the user just sees
-            # session/new fail with an opaque ACP error — the most likely first
-            # failure on a headless host.
-            if client.auth_methods:
-                raise ClaudeCodeAuthRequired(
-                    "Claude Code is not authenticated. Run `claude` once to log "
-                    "in, or on a headless host create a subscription token with "
-                    "`claude setup-token` and set CLAUDE_CODE_OAUTH_TOKEN."
-                )
-            session_id = client.session_new()
-            with self._lock:
-                self._session_id = session_id
-
-            # SECURITY: the adapter starts in `auto`, where a classifier
-            # approves writes and shell commands without ever asking Hermes.
-            # Move it to `default` before any prompt runs so every decision
-            # comes back to us as session/request_permission. Until the rich
-            # approval UX lands (Packet 3) we answer every one of them with a
-            # denial, so an unattended turn cannot mutate the workspace.
-            client.set_mode(session_id, _PERMISSION_MODE)
-
-            # A cancel that landed during the handshake must not be lost.
-            if self._cancel_requested.is_set():
-                client.cancel(session_id)
-
-            try:
-                result = client.prompt(
-                    session_id,
-                    [{"type": "text", "text": user_message}],
-                    on_update=self._on_update,
-                    on_request=self._on_request,
-                    on_dispatched=self._reissue_cancel_if_pending,
-                    timeout=_TURN_TIMEOUT_SECONDS,
-                )
-            except Exception:
-                # Tell the adapter to stop before we tear the pipes down, so
-                # it can wind its own session down rather than being killed
-                # mid-tool.
-                try:
-                    client.cancel(session_id)
-                except Exception:
-                    logger.debug("cancel-on-teardown failed", exc_info=True)
-                raise
-            return {
-                "text": "".join(self.text_parts),
-                "stop_reason": result.get("stopReason"),
-            }
-        finally:
-            try:
-                self.stderr_tail = client.stderr_tail()
-            except Exception:
-                self.stderr_tail = []
-            # Deterministic reaping: no adapter outlives its turn, on any
-            # path — success, protocol error, cancel, or unexpected raise.
-            try:
-                client.close()
-            except Exception:
-                logger.debug("ACP client close failed", exc_info=True)
-            with self._lock:
-                self._client = None
-
-    def _on_update(self, update: Dict[str, Any]) -> None:
-        """Collect assistant text only.
-
-        ``tool_call`` / ``tool_call_update`` / ``agent_thought_chunk`` carry
-        structured payloads that must never reach the user-visible response —
-        leaking them as text was exactly the direct-CLI failure this runtime
-        replaces. Packet 3 projects them into Hermes' tool-activity display.
-        """
-        if update.get("sessionUpdate") != "agent_message_chunk":
-            return
-        content = update.get("content") or {}
-        if content.get("type") == "text":
-            self.text_parts.append(content.get("text", ""))
-
-    def _on_request(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Answer agent-initiated requests. Permissions are denied outright.
-
-        Packet 1 has no approval UX, and "no UX" must mean *deny*, never
-        *silently allow*. Returning a reject option (rather than letting the
-        request go unanswered) also keeps the turn moving: an unanswered
-        agent request deadlocks the prompt.
-        """
-        from agent.transports.claude_acp import deny_permission_response
-
-        if method == "session/request_permission":
-            self.denied_permissions += 1
-            logger.info(
-                "Claude Code ACP: denied a permission request (no approval UX "
-                "in this runtime yet)"
-            )
-            return deny_permission_response(params.get("options") or [])
-        raise PermissionError(f"client does not handle {method}")
+            session.close()
+        except Exception:
+            logger.debug("closing the previous ACP session failed", exc_info=True)
+    session = ClaudeAcpSession(
+        argv=argv,
+        cwd=cwd,
+        store=BindingStore.for_agent(agent),
+        # A persistence-isolated fork shares the parent's session_id, so
+        # keying the registry on it would retire the user's live adapter out
+        # from under the conversation. Forks get their own anonymous slot.
+        hermes_session_id=(
+            ""
+            if getattr(agent, "_persist_disabled", False)
+            else str(getattr(agent, "session_id", "") or "")
+        ),
+    )
+    agent._claude_acp_session = session
+    return session
 
 
 def run_claude_code_acp_turn(
@@ -290,19 +212,26 @@ def run_claude_code_acp_turn(
         logger.warning("Claude Code ACP adapter unavailable: %s", exc)
         return _failure_result(agent, messages, str(exc))
 
-    turn = ClaudeAcpTurn(argv=argv, cwd=cwd)
-    # Published so AIAgent.interrupt() can reach the in-flight turn.
-    agent._claude_acp_turn = turn
-    # An interrupt that landed BEFORE this publication had nothing to cancel:
-    # AIAgent.interrupt() looks up `_claude_acp_turn`, finds None, and the
-    # request is lost. The adapter would then run to the full turn timeout
-    # with the user believing they stopped it. Fold that already-latched flag
-    # into the turn so the cancel is delivered as soon as a session exists.
-    if getattr(agent, "_interrupt_requested", False):
-        turn.request_cancel()
+    session = _get_or_create_session(agent, argv, cwd)
 
     try:
-        outcome = turn.run(user_message)
+        outcome = session.run_turn(
+            user_message,
+            recap_provider=lambda: _build_recap(messages),
+            # An interrupt that landed BEFORE this turn started has nothing to
+            # cancel yet: AIAgent.interrupt() finds no in-flight turn and the
+            # request would be lost, leaving the adapter to run to the full
+            # turn timeout while the user believes they stopped it. Carry the
+            # latched flag into the turn so the cancel goes out as soon as a
+            # session exists.
+            cancel_pending=bool(getattr(agent, "_interrupt_requested", False)),
+        )
+    except TurnLeaseConflict as exc:
+        # Refuse rather than spawning a second adapter against a session
+        # another process is already driving — that is how one turn gets
+        # delivered twice.
+        logger.warning("Claude Code ACP turn lease conflict: %s", exc)
+        return _failure_result(agent, messages, f"Claude Code: {exc}")
     except FileNotFoundError as exc:
         logger.warning("Claude Code ACP adapter could not be spawned: %s", exc)
         from hermes_cli.auth import CLAUDE_CODE_ACP_PACKAGE
@@ -317,19 +246,19 @@ def run_claude_code_acp_turn(
     except ClaudeCodeAuthRequired as exc:
         # A setup problem, not a turn failure: say exactly what to run.
         logger.warning("Claude Code ACP authentication required")
-        return _failure_result(agent, messages, f"{exc}{_diagnostics(turn)}")
+        return _failure_result(agent, messages, f"{exc}{_diagnostics(session)}")
     except Exception as exc:
         logger.exception("Claude Code ACP turn failed")
         return _failure_result(
             agent, messages,
-            f"Claude Code ACP turn failed: {exc}{_diagnostics(turn)}",
+            f"Claude Code ACP turn failed: {exc}{_diagnostics(session)}",
         )
-    finally:
-        agent._claude_acp_turn = None
 
-    final_text = outcome["text"]
-    stop_reason = outcome["stop_reason"]
-    cancelled = stop_reason == "cancelled" or turn.cancel_requested
+    final_text = outcome.text
+    stop_reason = outcome.stop_reason
+    cancelled = stop_reason == "cancelled" or bool(
+        getattr(agent, "_interrupt_requested", False)
+    )
 
     # Mirror the conversation-loop finalizer's interrupt handoff: this early
     # return bypasses it. Key off Hermes' own latched flag, NOT the wire stop
@@ -368,11 +297,26 @@ def run_claude_code_acp_turn(
             final_text = "Claude Code returned an empty response."
             error = "empty response from Claude Code"
 
+    # Exactly one visible marker, on the turn whose Claude-side session was
+    # rebuilt. It rides inside the assistant message rather than being a
+    # message of its own, so role alternation is untouched.
+    if outcome.reseeded:
+        final_text = f"{RESEED_MARKER}\n\n{final_text}" if final_text else RESEED_MARKER
+
     # The inbound user message was already appended by run_conversation()
     # before the early return, so only the reply is added here.
     if final_text:
         messages.append({"role": "assistant", "content": final_text})
         _persist(agent, messages)
+
+    # A fork lives for exactly one turn, so its adapter is per-turn state:
+    # reap it now rather than holding a Claude Code process open until exit.
+    if getattr(agent, "_persist_disabled", False):
+        try:
+            session.close()
+        except Exception:
+            logger.debug("closing a forked ACP session failed", exc_info=True)
+        agent._claude_acp_session = None
 
     agent.session_api_calls = getattr(agent, "session_api_calls", 0) + 1
     _run_improvement_hooks(

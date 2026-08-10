@@ -291,6 +291,39 @@ class ClaudeAcpClient:
         with self._stderr_lock:
             return list(self._stderr_ring)
 
+    def is_alive(self) -> bool:
+        """Whether this connection can still carry a request.
+
+        A long-lived client outlives a single turn, so callers must be able to
+        ask before reusing it — the adapter can be killed, crash, or be reaped
+        between turns, and writing to a dead child only surfaces as a broken
+        pipe mid-request.
+        """
+        return not self._closed and self._proc.poll() is None
+
+    def drain_inbox(self) -> int:
+        """Discard queued notifications; return how many were dropped.
+
+        Anything sitting in the inbox before a request is dispatched belongs
+        to something that is *not* that request — most importantly the history
+        ``session/load`` replays, which Hermes must never project (it owns the
+        transcript). JSON-RPC over one stdio stream is ordered, so draining
+        after a reply removes everything the agent emitted before it.
+
+        The EOF sentinel is preserved: dropping it would hide a dead child
+        from the request loop.
+        """
+        dropped = 0
+        while True:
+            try:
+                msg = self._inbox.get_nowait()
+            except queue.Empty:
+                return dropped
+            if msg is None:
+                self._inbox.put(None)
+                return dropped
+            dropped += 1
+
     # ---------- reader threads ----------
 
     def _read_stdout(self) -> None:

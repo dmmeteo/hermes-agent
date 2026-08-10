@@ -9,8 +9,31 @@ Env vars:
                      observed — the ``session/prompt`` params, every
                      ``session/set_mode`` call, the Anthropic-related env vars
                      it inherited, and any permission decision it received.
+``FAKE_ACP_RECORD_DIR``
+                     directory variant of the above: each adapter *process*
+                     writes ``<dir>/<pid>.json``. Packet 2 spans several
+                     adapter processes per conversation (restart, idle
+                     eviction), and a single shared path would let the newest
+                     adapter overwrite the evidence of the previous one.
+``FAKE_ACP_STORE``   directory holding this adapter's own agent-side session
+                     state, one ``<sessionId>.json`` per session. Models the
+                     real adapter's ``~/.claude`` history: it survives the
+                     adapter process, so ``session/load`` can genuinely recall
+                     earlier turns. Hermes must never write here.
 ``FAKE_ACP_MODE``
     ``normal``        stream text + a tool_call, then ``end_turn``
+    ``memory``        answer with the prompts this ACP session has already
+                      seen (``recall[...]``), then remember the new one.
+                      Requires ``FAKE_ACP_STORE``.
+    ``memory-gated``  like ``memory``, but hold the turn open until the path
+                      in ``FAKE_ACP_GATE`` exists
+    ``hang``          accept the prompt and never answer it
+    ``no-load``       like ``memory``, but advertise ``loadSession: false``
+    ``load-fails``    like ``memory``, but fail every ``session/load``
+    ``load-replays-late``
+                      like ``memory``, but emit one history update AFTER the
+                      ``session/load`` reply — the race that would otherwise
+                      leak replayed history into the next turn's response
     ``error``         reply to ``session/prompt`` with a JSON-RPC error
     ``slow``          stream slowly until cancelled
     ``ignore-cancel`` ignore ``session/cancel`` and still answer ``end_turn``
@@ -40,7 +63,10 @@ import time
 
 _MODE = os.getenv("FAKE_ACP_MODE", "normal")
 _RECORD_PATH = os.getenv("FAKE_ACP_RECORD", "")
+_RECORD_DIR = os.getenv("FAKE_ACP_RECORD_DIR", "")
+_STORE_DIR = os.getenv("FAKE_ACP_STORE", "")
 _cancelled = threading.Event()
+_session_counter = 0
 
 # Anthropic credential vars must NOT reach this child: the provider advertises
 # subscription auth. The runtime strips them; the tests assert on this record.
@@ -60,6 +86,11 @@ _record: dict = {
     "permission_outcome": None,
     "wrote_file": False,
     "grandchild_pid": None,
+    # Packet 2 evidence: which sessions this adapter process created vs.
+    # rebound, and every prompt it was given (so recap content is assertable).
+    "session_new_calls": [],
+    "session_load_calls": [],
+    "prompts": [],
 }
 _record_lock = threading.Lock()
 
@@ -68,12 +99,52 @@ _reply_ready = threading.Condition()
 
 
 def _flush_record() -> None:
-    if not _RECORD_PATH:
+    if not _RECORD_PATH and not _RECORD_DIR:
         return
     with _record_lock:
         snapshot = json.loads(json.dumps(_record))
-    with open(_RECORD_PATH, "w", encoding="utf-8") as handle:
-        json.dump(snapshot, handle)
+    for path in (
+        _RECORD_PATH,
+        os.path.join(_RECORD_DIR, f"{os.getpid()}.json") if _RECORD_DIR else "",
+    ):
+        if not path:
+            continue
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(snapshot, handle)
+
+
+# ---------------------------------------------------------------- agent store
+
+
+def _store_path(session_id: str) -> str:
+    return os.path.join(_STORE_DIR, f"{session_id}.json")
+
+
+def _store_read(session_id: str) -> dict:
+    try:
+        with open(_store_path(session_id), "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
+def _store_write(session_id: str, data: dict) -> None:
+    if not _STORE_DIR:
+        return
+    os.makedirs(_STORE_DIR, exist_ok=True)
+    with open(_store_path(session_id), "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+
+
+def _prompt_text(params: dict) -> str:
+    """Flatten the ACP content blocks of a prompt into plain text."""
+    return " ".join(
+        str(block.get("text") or "")
+        for block in (params.get("prompt") or [])
+        if isinstance(block, dict)
+    ).strip()
 
 
 def _send(obj: dict) -> None:
@@ -138,12 +209,86 @@ def _handle_permission(session_id: str, msg: dict) -> None:
     _send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}})
 
 
+def _new_session_id() -> str:
+    """A fresh session id, unique across adapter processes and sessions."""
+    global _session_counter
+    _session_counter += 1
+    session_id = f"fake-session-{os.getpid()}-{_session_counter}"
+    with _record_lock:
+        _record["session_new_calls"].append(session_id)
+    if _STORE_DIR:
+        _store_write(session_id, {"prompts": []})
+    _flush_record()
+    return session_id
+
+
+def _handle_load(msg: dict) -> None:
+    """Rebind an existing session, replaying its history first."""
+    params = msg.get("params") or {}
+    session_id = params.get("sessionId") or ""
+    with _record_lock:
+        _record["session_load_calls"].append(session_id)
+    _flush_record()
+
+    if _MODE == "load-fails":
+        _send({"jsonrpc": "2.0", "id": msg["id"], "error": {
+            "code": -32002, "message": "session cannot be resumed",
+        }})
+        return
+
+    stored = _store_read(session_id)
+    if not stored:
+        _send({"jsonrpc": "2.0", "id": msg["id"], "error": {
+            "code": -32002, "message": f"unknown session {session_id}",
+        }})
+        return
+
+    # A real adapter replays the session transcript as notifications before
+    # answering. Hermes owns the transcript, so none of this may ever reach
+    # the user-visible response.
+    for prompt in stored.get("prompts") or []:
+        _text(session_id, f"REPLAYED-HISTORY:{prompt}")
+    _send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+    if _MODE == "load-replays-late":
+        # The nastier shape of the same hazard: a replay notification emitted
+        # AFTER the load reply, i.e. once the client has moved on. stdio is
+        # ordered, so the client is guaranteed to see this before the reply to
+        # whatever it sends next — draining before the prompt is what stops it
+        # from being read as this turn's output.
+        _text(session_id, "REPLAYED-HISTORY:late-arrival")
+
+
 def _handle_prompt(msg: dict) -> None:
     params = msg.get("params") or {}
     session_id = params.get("sessionId")
     with _record_lock:
         _record["prompt"] = params
+        _record["prompts"].append(params)
     _flush_record()
+
+    if _MODE == "hang":
+        # Never answers: models an adapter wedged inside a turn. The caller
+        # has to hit its own turn timeout and retire the session.
+        while True:
+            time.sleep(0.2)
+
+    if _MODE in ("memory", "no-load", "load-fails", "load-replays-late", "memory-gated"):
+        if _MODE == "memory-gated":
+            # Hold the turn open until the test opens the gate, so the caller
+            # can observe in-flight state (the turn lease) from another thread.
+            gate = os.getenv("FAKE_ACP_GATE", "")
+            while gate and not os.path.exists(gate):
+                time.sleep(0.05)
+        # Answer from this ACP session's own remembered history, then add the
+        # new turn to it. The store outlives the process, so a reloaded
+        # session recalls turns an earlier adapter served.
+        stored = _store_read(session_id)
+        prior = stored.get("prompts") or []
+        _text(session_id, "recall[" + " | ".join(prior) + "]")
+        prior.append(_prompt_text(params))
+        _store_write(session_id, {"prompts": prior})
+        _send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}})
+        return
 
     if _MODE == "error":
         _send({"jsonrpc": "2.0", "id": msg["id"],
@@ -247,9 +392,11 @@ def main() -> None:
             )
             _send({"jsonrpc": "2.0", "id": msg["id"], "result": {
                 "protocolVersion": 1,
-                "agentCapabilities": {"loadSession": True},
+                "agentCapabilities": {"loadSession": _MODE != "no-load"},
                 "authMethods": auth_methods,
             }})
+        elif method == "session/load":
+            _handle_load(msg)
         elif method == "session/new":
             if _MODE == "auth-required":
                 _send({"jsonrpc": "2.0", "id": msg["id"], "error": {
@@ -271,7 +418,7 @@ def main() -> None:
                 }})
                 continue
             _send({"jsonrpc": "2.0", "id": msg["id"],
-                   "result": {"sessionId": "fake-session-1"}})
+                   "result": {"sessionId": _new_session_id()}})
         elif method == "session/set_mode":
             with _record_lock:
                 _record["set_mode_calls"].append((msg.get("params") or {}).get("modeId"))

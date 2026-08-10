@@ -123,11 +123,13 @@ class TestPermissionSafety:
 
     def test_unknown_agent_request_is_refused_not_ignored(self, tmp_path, monkeypatch):
         """An unhandled agent request must still get a reply, or the turn hangs."""
-        from agent.claude_code_runtime import ClaudeAcpTurn
+        from agent.claude_acp_session import ClaudeAcpSession
 
-        turn = ClaudeAcpTurn(argv=[sys.executable, _FAKE_ADAPTER], cwd=str(tmp_path))
+        session = ClaudeAcpSession(
+            argv=[sys.executable, _FAKE_ADAPTER], cwd=str(tmp_path)
+        )
         with pytest.raises(PermissionError):
-            turn._on_request("terminal/create", {})
+            session._on_request("terminal/create", {})
 
 
 class TestInterruptLatchCleared:
@@ -198,10 +200,13 @@ class TestInterruptLatchCleared:
         agent.run_conversation("first turn")
         interrupter.join(timeout=20)
 
-        monkeypatch.setenv("FAKE_ACP_MODE", "normal")
+        # From Packet 2 the SAME adapter process serves turn two (session
+        # reuse), so it keeps the mode it was spawned with — what matters is
+        # that the turn runs and completes rather than inheriting the latch.
         second = agent.run_conversation("second turn")
-        assert second["final_response"] == "The answer is 42."
+        assert second["final_response"]
         assert second["completed"] is True
+        assert agent._interrupt_requested is False
 
 
 class TestAdapterChildEnvironment:
@@ -308,7 +313,13 @@ class TestAuthFailureDiagnostics:
 class TestProcessTreeCleanup:
     """F7 — 'no stale subprocess under any exit path' must include descendants."""
 
-    def test_grandchild_does_not_survive_the_turn(self, tmp_path, monkeypatch):
+    def test_grandchild_does_not_survive_the_session(self, tmp_path, monkeypatch):
+        """Packet 2 moved the boundary from the turn to the session.
+
+        The adapter is now long-lived and legitimately outlives a turn, so the
+        reaping contract is asserted where teardown actually happens — and it
+        still has to take the whole process tree with it.
+        """
         record = tmp_path / "record.json"
         agent = _agent_with(tmp_path, "grandchild", monkeypatch, record)
 
@@ -318,12 +329,14 @@ class TestProcessTreeCleanup:
         grandchild_pid = data["grandchild_pid"]
         assert grandchild_pid, "fake adapter did not report a grandchild pid"
 
+        agent.close()
+
         deadline = time.time() + 5
         while time.time() < deadline and _pid_alive(grandchild_pid):
             time.sleep(0.1)
         assert not _pid_alive(grandchild_pid), (
-            "the adapter's descendant outlived the turn — killing only the "
-            "direct child is exactly the leak Packet 1 must prevent"
+            "the adapter's descendant outlived the session — killing only the "
+            "direct child is exactly the leak this runtime must prevent"
         )
 
     def test_adapter_is_spawned_in_its_own_process_group(self, tmp_path):

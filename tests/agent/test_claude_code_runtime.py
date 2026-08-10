@@ -144,10 +144,18 @@ class TestOneRealTurn:
 
 
 class TestDeterministicReaping:
-    def test_no_orphan_after_a_successful_turn(self, agent, tmp_path, monkeypatch):
+    """The adapter outlives a turn from Packet 2 on, but never a session.
+
+    Session reuse is the point of Packet 2, so "reaped at turn end" is no
+    longer the contract; "reaped at every teardown path, with no orphan left
+    anywhere" still is.
+    """
+
+    def test_no_orphan_after_the_session_is_closed(self, agent, tmp_path, monkeypatch):
         record = tmp_path / "record.json"
         monkeypatch.setenv("FAKE_ACP_RECORD", str(record))
         agent.run_conversation("what is the answer?")
+        agent.close()
         _assert_reaped(record)
 
     def test_no_orphan_after_an_adapter_error(self, tmp_path, monkeypatch):
@@ -181,8 +189,11 @@ class TestDeterministicReaping:
         threading.Thread(target=interrupt_soon, daemon=True).start()
         result = a.run_conversation("count forever")
 
-        _assert_reaped(record)
         assert result["interrupted"] is True
+        # A cancelled turn leaves a healthy adapter, so it is kept for the next
+        # turn; closing the session is what must reap it.
+        a.close()
+        _assert_reaped(record)
 
 
 class TestMissingAdapter:

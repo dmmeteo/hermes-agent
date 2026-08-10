@@ -3159,8 +3159,8 @@ class AIAgent:
         # Cancellation is a protocol verb: notify session/cancel and let the
         # in-flight session/prompt settle as stopReason="cancelled".
         if getattr(self, "api_mode", None) == "claude_code_acp":
-            _acp_turn = getattr(self, "_claude_acp_turn", None)
-            _request_cancel = getattr(_acp_turn, "request_cancel", None)
+            _acp_session = getattr(self, "_claude_acp_session", None)
+            _request_cancel = getattr(_acp_session, "request_cancel", None)
             if callable(_request_cancel):
                 try:
                     _request_cancel()
@@ -4399,6 +4399,19 @@ class AIAgent:
             if codex_session is not None:
                 self._codex_session = None
                 codex_session.close()
+        except Exception:
+            pass
+
+        # 6d. Same for the Claude Code ACP session. Its adapter is long-lived
+        # from Packet 2 on (one per Hermes session, reused across turns) and
+        # leads its own process group, so nothing else would reap it at a
+        # session boundary (/new, /reset, expiry). Clear the attribute BEFORE
+        # close() so a raising close() cannot strand a stale reference.
+        try:
+            acp_session = getattr(self, "_claude_acp_session", None)
+            if acp_session is not None:
+                self._claude_acp_session = None
+                acp_session.close()
         except Exception:
             pass
 

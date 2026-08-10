@@ -2,7 +2,9 @@
 
 **Status:** Packet 0 complete (gate passed). Packet 1 complete after one
 remediation pass against an independent review (findings F1–F9, F13, F15).
-Packets 2–3 not started.
+Packet 2 complete — see
+[`2026-08-10-claude-code-acp-packet2-report.md`](2026-08-10-claude-code-acp-packet2-report.md).
+Packet 3 not started.
 **Branch:** `feat/claude-code-acp-runtime`
 **Spike report:** [`2026-08-09-claude-code-acp-packet0-spike.md`](2026-08-09-claude-code-acp-packet0-spike.md)
 
@@ -59,7 +61,8 @@ precedent for this shape.
 | Steer hook | `run_agent.py:3348` | Decide: queue vs. `promptQueueing` capability |
 | api_mode allow-list | `agent/agent_init.py:637` | Add `"claude_code_acp"` |
 | Runtime module | new `agent/claude_code_runtime.py` | Analogue of `agent/codex_runtime.py` |
-| Session adapter | new `agent/transports/claude_acp_session.py` | Analogue of `codex_app_server_session.py` |
+| Session adapter | new `agent/claude_acp_session.py` | Analogue of `codex_app_server_session.py` (**exists, Packet 2**) |
+| Session binding + turn lease | new `agent/claude_acp_binding.py` | ACP session id + lease on the Hermes `sessions.model_config` row (**exists, Packet 2**) |
 | Event projection | new `agent/transports/claude_acp_event_projector.py` | Analogue of `codex_event_projector.py` |
 | Wire client | `agent/transports/claude_acp.py` | **Exists (Packet 0)** |
 | Provider surface | `plugins/model-providers/claude-code-acp/__init__.py` | `register_provider(ProviderProfile(api_mode="claude_code_acp", auth_type="external_process"))`. NOT `claude-code/` — the `anthropic` profile already owns the `claude-code` alias. |
@@ -188,10 +191,20 @@ replaying history, or if a stale process survives any exit path.
 
 ---
 
-## Packet 2 — Session continuity
+## Packet 2 — Session continuity ✅ COMPLETE
 
 **Goal.** A Hermes conversation keeps one Claude Code session across many
 turns, and survives adapter restart without a second recovery journal.
+
+**Result.** Delivered as specified; every acceptance check below has a test
+driving real adapter subprocesses. The binding lives in one `model_config`
+key (`claude_acp`) on the Hermes `sessions` row — the same column that already
+carries `browser_model_lock` / `yolo_mode` / `_delegate_from` — and carries the
+turn lease with it. Adapter lifetime moved from the turn to the **session**:
+`tests/agent/test_claude_code_runtime{,_safety}.py` had two reaping assertions
+rewritten from "reaped at turn end" to "reaped at session teardown", which is
+the contract this packet deliberately replaces. Full evidence, plus the
+background-review interaction found on the way, is in the Packet 2 report.
 
 **Scope.**
 - Persist the ACP session id as a discardable binding on the Hermes session.
