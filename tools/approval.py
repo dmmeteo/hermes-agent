@@ -3570,6 +3570,78 @@ def request_tool_approval(
     )
 
 
+def request_delegated_runtime_approval(
+    runtime: str,
+    action: str,
+    description: str,
+    *,
+    rule_key: str = "",
+    approval_callback=None,
+) -> dict:
+    """Escalate an action a *delegated coding runtime* wants to take.
+
+    A delegated runtime (Claude Code over ACP, and any future sibling) runs its
+    own agentic loop in a subprocess with its own tools, so Hermes' tool loop —
+    and therefore ``check_all_command_guards`` — never sees the write or the
+    shell command. What Hermes does see is the runtime asking permission over
+    its protocol. This routes that request into the SAME human gate as a
+    dangerous shell pattern or a plugin escalation: one decision core
+    (:func:`_run_approval_gate`), one set of allowlists, one timeout, one
+    fail-closed policy.
+
+    Args:
+        runtime: User-facing runtime name (e.g. ``"Claude Code"``). Appears in
+            the prompt so the user knows who is asking.
+        action: The runtime's own name for what it wants to do (``"Write"``,
+            ``"Bash"``, ``"Edit"``). Named honestly — it is NOT a Hermes tool.
+        description: Human-facing, already-scrubbed summary of the action.
+        rule_key: Stable identifier controlling the ``[a]lways`` grain. Callers
+            pass a signature of *what is being asked* so answering "always" to
+            one action cannot blanket a different one on the same tool.
+        approval_callback: Optional CLI callback (same contract as elsewhere).
+
+    Returns:
+        ``{"approved": bool, "message": str|None, ...}`` — the shared shape.
+
+    Non-interactive contexts fail CLOSED (cron honours ``approvals.cron_mode``
+    as everywhere else): a delegated runtime must never get a write through
+    simply because nobody was there to refuse it.
+    """
+    label = f"{runtime}: {action}"
+    if rule_key:
+        key_suffix = rule_key
+    else:
+        key_suffix = hashlib.sha256(
+            f"{action}\n{description}".encode("utf-8")
+        ).hexdigest()[:12]
+    # Namespaced so a delegated-runtime grant can never collide with a real
+    # command pattern key or a plugin rule key.
+    pattern_key = f"delegated_runtime:{runtime.strip().lower()}:{action}:{key_suffix}"
+    display_target = f"<{label}>"
+
+    return _run_approval_gate(
+        pattern_key=pattern_key,
+        description=description,
+        display_target=display_target,
+        approval_callback=approval_callback,
+        cron_deny_message=(
+            f"BLOCKED: {runtime} asked to run '{action}' ({description}) but "
+            "cron jobs run without a user present to approve it. To allow "
+            "flagged actions in cron jobs, set approvals.cron_mode: approve in "
+            "config.yaml."
+        ),
+        autoapprove_log_prefix=(
+            f"delegated runtime '{runtime}' action '{action}' in "
+            "non-interactive non-gateway context"
+        ),
+        fail_closed_when_no_human=True,
+        no_human_block_message=(
+            f"BLOCKED: {runtime} asked to run '{action}' ({description}) but no "
+            "interactive user or gateway is present to approve it."
+        ),
+    )
+
+
 # =========================================================================
 # Combined pre-exec guard (tirith + dangerous command detection)
 # =========================================================================

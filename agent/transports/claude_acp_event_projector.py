@@ -46,10 +46,12 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ClaudeAcpEventProjector",
+    "PermissionRequest",
     "ProjectedEvent",
     "ToolActivity",
     "UsageSnapshot",
     "deterministic_call_id",
+    "project_permission_request",
 ]
 
 #: Statuses that end a tool call. Anything else is progress, not an outcome.
@@ -65,6 +67,9 @@ _MAX_ARG_CHARS = 2000
 _MAX_PREVIEW_CHARS = 120
 #: Guards against a pathological nesting depth in `rawInput` / `rawOutput`.
 _MAX_SCRUB_DEPTH = 6
+#: How many declared tool locations an approval prompt may name. A tool that
+#: touches 400 files must not turn the prompt into a wall of paths.
+_MAX_LOCATIONS = 8
 
 
 def deterministic_call_id(tool_call_id: str) -> str:
@@ -159,6 +164,146 @@ def _result_text(payload: Dict[str, Any]) -> str:
     else:
         text = _content_text(payload.get("content"))
     return _truncate(_scrub_text(text), _MAX_RESULT_CHARS)
+
+
+def _declared_tool_name(payload: Dict[str, Any]) -> str:
+    """The adapter's own tool name from ``_meta.claudeCode.toolName``, or ``""``.
+
+    Shared by tool-activity projection and permission-request projection so a
+    tool is named the same way in an approval prompt as in a progress bubble.
+    """
+    meta = payload.get("_meta")
+    if isinstance(meta, dict):
+        claude_meta = meta.get("claudeCode")
+        if isinstance(claude_meta, dict):
+            name = claude_meta.get("toolName")
+            if isinstance(name, str) and name.strip():
+                return _truncate(_scrub_text(name.strip()), _MAX_PREVIEW_CHARS)
+    return ""
+
+
+def _locations(payload: Dict[str, Any]) -> List[str]:
+    """Every scrubbed ``ToolCallLocation`` path declared by a tool call.
+
+    Each path is bounded by the *display* budget, not the argument budget: these
+    become approval-prompt text, and on a messaging platform that text leaves
+    the machine, so a path is bounded exactly like every other human-facing
+    field in this module.
+
+    The list itself is deliberately NOT truncated here. Identity (the approval
+    signature) has to see every path a tool declared — two asks that agree on
+    their first few paths but differ later must not share one remembered grant.
+    Bounding the list for *display* is :func:`project_permission_request`'s job.
+    """
+    raw = payload.get("locations")
+    if not isinstance(raw, list):
+        return []
+    paths: List[str] = []
+    for entry in raw:
+        if isinstance(entry, dict):
+            path = entry.get("path")
+        else:
+            path = entry
+        if isinstance(path, str) and path.strip():
+            paths.append(_truncate(_scrub_text(path.strip()), _MAX_PREVIEW_CHARS))
+    return paths
+
+
+@dataclass
+class PermissionRequest:
+    """One ``session/request_permission``, as a human approval surface sees it.
+
+    Display-bound and already scrubbed: this is the record that becomes the text
+    of a CLI prompt or a Discord/Telegram approval message, so nothing on it may
+    carry a credential or an unbounded payload. The protocol ``options`` are
+    deliberately NOT here — answering the wire is the session's job, and the
+    approval surface has no business choosing an ``optionId``.
+    """
+
+    tool_name: str
+    title: str = ""
+    kind: str = ""
+    args: Dict[str, Any] = field(default_factory=dict)
+    #: The paths shown to the user — at most ``_MAX_LOCATIONS`` of them.
+    locations: List[str] = field(default_factory=list)
+    #: How many further paths the tool declared but the prompt does not list.
+    #: Reported rather than dropped: a user approving "affects a.py, b.py" when
+    #: 392 more files are in scope has been shown the wrong action.
+    omitted_locations: int = 0
+    #: Stable-per-request identity for Hermes' allowlist grain: two requests that
+    #: describe the same action share it, so ``[a]lways`` cannot blanket a
+    #: different action on the same tool.
+    signature: str = ""
+
+    @property
+    def description(self) -> str:
+        """One line naming what is being asked, for the approval prompt."""
+        parts: List[str] = []
+        if self.title:
+            parts.append(self.title)
+        elif self.kind:
+            parts.append(f"{self.kind} operation")
+        if self.locations:
+            affects = "affects " + ", ".join(self.locations)
+            if self.omitted_locations:
+                affects += f" (+{self.omitted_locations} more)"
+            parts.append(affects)
+        elif self.omitted_locations:
+            parts.append(f"affects {self.omitted_locations} paths")
+        return "; ".join(parts) or f"{self.tool_name} requested permission"
+
+
+def project_permission_request(params: Dict[str, Any]) -> PermissionRequest:
+    """Project ``session/request_permission`` params into a display record.
+
+    Pure: no wire, no callbacks, no filesystem. Every field is
+    credential-scrubbed and bounded before truncation, exactly as for a
+    projected update — an approval prompt is user-visible text, and on a
+    messaging platform it leaves the machine.
+    """
+    tool_call = params.get("toolCall")
+    if not isinstance(tool_call, dict):
+        tool_call = {}
+    title_raw = tool_call.get("title")
+    title = (
+        _truncate(_scrub_text(title_raw.strip()), _MAX_PREVIEW_CHARS)
+        if isinstance(title_raw, str) and title_raw.strip()
+        else ""
+    )
+    kind_raw = tool_call.get("kind")
+    kind = (
+        _truncate(_scrub_text(kind_raw.strip()), _MAX_PREVIEW_CHARS)
+        if isinstance(kind_raw, str) and kind_raw.strip()
+        else ""
+    )
+    name = _declared_tool_name(tool_call) or kind or "tool"
+    args = _as_args(tool_call.get("rawInput"))
+    declared = _locations(tool_call)
+    # Display is bounded; identity is not. A tool touching 400 files must not
+    # turn the prompt into a wall of paths, but the paths it does not show still
+    # have to reach the signature — otherwise two different mass edits sharing
+    # their first eight paths would share one remembered grant.
+    shown = declared[:_MAX_LOCATIONS]
+    # Identity is derived from WHAT is being asked, never from the adapter's
+    # per-call ``toolCallId``: a remembered grant must apply to the same action
+    # asked again, and must not apply to a different one.
+    try:
+        signature = json.dumps(
+            {"tool": name, "kind": kind, "title": title,
+             "locations": declared, "args": args},
+            ensure_ascii=False, sort_keys=True, default=str,
+        )
+    except (TypeError, ValueError):
+        signature = f"{name}|{kind}|{title}|{declared}"
+    return PermissionRequest(
+        tool_name=name,
+        title=title,
+        kind=kind,
+        args=args,
+        locations=shown,
+        omitted_locations=len(declared) - len(shown),
+        signature=signature,
+    )
 
 
 @dataclass
@@ -287,13 +432,9 @@ class ClaudeAcpEventProjector:
         ``Bash``, ``Edit``, …) — that is the tool that actually ran, and naming
         it honestly beats mapping it onto a Hermes tool that did not.
         """
-        meta = payload.get("_meta")
-        if isinstance(meta, dict):
-            claude_meta = meta.get("claudeCode")
-            if isinstance(claude_meta, dict):
-                name = claude_meta.get("toolName")
-                if isinstance(name, str) and name.strip():
-                    return _truncate(_scrub_text(name.strip()), _MAX_PREVIEW_CHARS)
+        declared = _declared_tool_name(payload)
+        if declared:
+            return declared
         if existing is not None and existing.name:
             return existing.name
         kind = payload.get("kind")

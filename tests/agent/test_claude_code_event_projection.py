@@ -424,9 +424,16 @@ class TestInvariantsPreserved:
             os.path.join(agent.session_cwd, fake.REPORTED_LOCATION)
         )
 
-    def test_permission_requests_are_still_denied(self, tmp_path, monkeypatch):
-        """Slice 3A projects events only — the Packet 1 deny posture stands
-        until the approval bridge lands."""
+    def test_a_permission_request_is_denied_with_no_approval_surface(
+        self, tmp_path, monkeypatch
+    ):
+        """Deny is still the default when nobody can be asked.
+
+        Slice 3B routes permission requests to Hermes' approval flow, but this
+        turn runs with no interactive CLI, no gateway, and no registered
+        callback — so the gate fails closed and the write never happens.
+        The bridge itself is covered by
+        ``tests/agent/test_claude_code_permission_bridge.py``."""
         agent = _agent_with(tmp_path, "permission", monkeypatch)
         try:
             result = agent.run_conversation("write a file")

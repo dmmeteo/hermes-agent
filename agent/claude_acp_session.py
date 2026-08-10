@@ -23,8 +23,12 @@ What this adds over Packet 1's per-turn adapter:
   are evicted the same way.
 
 Security posture from Packet 1 is unchanged and re-applied on every rebind:
-``session/set_mode`` → ``default`` before any prompt, and every
-``session/request_permission`` Hermes receives is denied.
+``session/set_mode`` → ``default`` before any prompt, so the adapter's
+self-approving ``auto`` classifier never decides anything. What Packet 3B
+changes is what happens to the request that mode produces: instead of a blanket
+denial, it is offered to a ``permission_handler`` the runtime supplies (Hermes'
+own approval flow). Deny remains the default on every path where that handler is
+absent, unusable, or unsuccessful — see ``_decide_permission``.
 """
 
 from __future__ import annotations
@@ -40,6 +44,7 @@ from agent.claude_acp_binding import BindingStore, TurnLease
 
 if TYPE_CHECKING:  # import-time cost stays off the hot path
     from agent.transports.claude_acp_event_projector import (
+        PermissionRequest,
         ProjectedEvent,
         UsageSnapshot,
     )
@@ -175,6 +180,7 @@ class ClaudeAcpSession:
         #: bounded, scrubbed adapter diagnostics.
         self.stderr_tail: List[str] = []
         self.denied_permissions = 0
+        self.granted_permissions = 0
         _register(self)
 
     # ---------- introspection ----------
@@ -362,6 +368,7 @@ class ClaudeAcpSession:
         recap_provider: Optional[Callable[[], str]] = None,
         cancel_pending: bool = False,
         event_sink: Optional[Callable[["ProjectedEvent"], None]] = None,
+        permission_handler: Optional[Callable[["PermissionRequest"], bool]] = None,
     ) -> AcpTurnOutcome:
         """Run one turn on this conversation's Claude Code session.
 
@@ -372,6 +379,12 @@ class ClaudeAcpSession:
         ``event_sink`` receives each ``ProjectedEvent`` the projector produces,
         in arrival order. It is the runtime's seam onto Hermes' display
         surfaces; this class stays free of any knowledge of them.
+
+        ``permission_handler`` is the same kind of seam for approvals: it is
+        handed a projected ``PermissionRequest`` and returns True to permit that
+        one action. It is called on this thread, synchronously, while the agent
+        waits — which is exactly what lets Hermes' existing per-thread approval
+        surfaces answer. Omitting it denies every request.
         """
         turn = _TurnState()
         if cancel_pending:
@@ -443,7 +456,11 @@ class ClaudeAcpSession:
                     session_id,
                     blocks,
                     on_update=_on_update,
-                    on_request=self._on_request,
+                    on_request=lambda method, request_params: self._on_request(
+                        method,
+                        request_params,
+                        permission_handler=permission_handler,
+                    ),
                     on_dispatched=lambda: self._reissue_cancel(turn),
                     timeout=TURN_TIMEOUT_SECONDS,
                 )
@@ -499,21 +516,87 @@ class ClaudeAcpSession:
             except Exception:
                 logger.debug("cancel re-issue failed", exc_info=True)
 
-    def _on_request(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Answer agent-initiated requests. Permissions are denied outright.
+    def _on_request(
+        self,
+        method: str,
+        params: Dict[str, Any],
+        *,
+        permission_handler: Optional[Callable[[Any], bool]] = None,
+    ) -> Dict[str, Any]:
+        """Answer agent-initiated requests. Only permissions are handled.
 
-        Packets 1–2 have no approval UX, and "no UX" must mean *deny*, never
-        *silently allow*. Returning a reject option (rather than leaving the
-        request unanswered) also keeps the turn moving: an unanswered agent
-        request deadlocks the prompt.
+        Runs on the thread driving the turn (the wire pumps inside
+        ``client.prompt``), which is what makes the Hermes-side decision see the
+        right per-thread state: the CLI's approval callback, the gateway's
+        session key contextvar, and the interrupt flag are all thread- or
+        context-local.
         """
-        from agent.transports.claude_acp import deny_permission_response
-
         if method == "session/request_permission":
-            self.denied_permissions += 1
-            logger.info(
-                "Claude Code ACP: denied a permission request (no approval UX "
-                "in this runtime yet)"
-            )
-            return deny_permission_response(params.get("options") or [])
+            return self._decide_permission(params, permission_handler)
         raise PermissionError(f"client does not handle {method}")
+
+    def _decide_permission(
+        self,
+        params: Dict[str, Any],
+        permission_handler: Optional[Callable[[Any], bool]],
+    ) -> Dict[str, Any]:
+        """Decide one ``session/request_permission``. Default is deny.
+
+        Protocol-level routing only — no approval policy lives here. The
+        Hermes-side decision (mode, allowlists, timeout, which surface asks the
+        user) belongs to ``tools/approval.py`` and reaches us through
+        ``permission_handler``; everything this method adds is the reasons a
+        request is refused *without* asking:
+
+        * no handler wired (no approval surface at all),
+        * the agent offered no single-shot allow option — permitting one would
+          hand the adapter a standing grant Hermes could no longer see,
+        * the turn is already cancelled: a user who pressed stop is not asked to
+          approve more work,
+        * the handler raised, or returned anything other than approval.
+
+        Always answers. An unanswered agent request deadlocks the prompt until
+        the turn timeout, which is strictly worse for the user than a denial.
+        """
+        from agent.transports.claude_acp import (
+            allow_permission_response,
+            deny_permission_response,
+        )
+
+        options = params.get("options") or []
+        allow = allow_permission_response(options)
+
+        def _deny(reason: str) -> Dict[str, Any]:
+            self.denied_permissions += 1
+            logger.info("Claude Code ACP: denied a permission request (%s)", reason)
+            return deny_permission_response(options)
+
+        if permission_handler is None:
+            return _deny("no approval surface is wired for this turn")
+        if allow is None:
+            return _deny(
+                "the agent offered no single-shot allow option; Hermes will not "
+                "grant a standing adapter-side permission"
+            )
+        if self.cancel_requested:
+            return _deny("the turn was already cancelled")
+
+        from agent.transports.claude_acp_event_projector import (
+            project_permission_request,
+        )
+
+        try:
+            approved = bool(permission_handler(project_permission_request(params)))
+        except Exception:
+            # A broken approval surface must not become an approval.
+            logger.warning(
+                "Claude Code ACP: the approval surface raised; denying",
+                exc_info=True,
+            )
+            return _deny("the approval surface raised")
+
+        if not approved:
+            return _deny("the user did not approve it")
+        self.granted_permissions += 1
+        logger.info("Claude Code ACP: permission granted for one action")
+        return allow

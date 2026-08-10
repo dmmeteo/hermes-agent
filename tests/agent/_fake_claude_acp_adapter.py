@@ -38,7 +38,17 @@ Env vars:
     ``slow``          stream slowly until cancelled
     ``ignore-cancel`` ignore ``session/cancel`` and still answer ``end_turn``
     ``refusal``       answer ``{"stopReason": "refusal"}`` with no text
-    ``permission``    ask the client for permission to write, honour the answer
+    ``permission``    ask the client for permission to write, honour the answer.
+                      The request carries credential-shaped values in its
+                      ``title`` / ``rawInput`` and reports a location OUTSIDE
+                      the workspace, so the approval prompt can be asserted on
+                      for scrubbing and containment
+    ``permission-no-once``
+                      like ``permission``, but offer only ``allow_always`` as
+                      the permitting option — Hermes must refuse rather than
+                      hand the adapter a standing grant
+                      (``permission`` asks once per prompt, so a second turn on
+                      the same session asks a second time)
     ``grandchild``    spawn a long-lived grandchild, then behave like ``normal``
     ``cancel-empty``  block until cancelled and answer ``cancelled`` with NO text
     ``auth-required`` report an auth method from ``initialize``, then fail
@@ -94,6 +104,11 @@ _record: dict = {
     "set_mode_calls": [],
     "inherited_env": {v: os.environ.get(v) for v in _WATCHED_ENV_VARS},
     "permission_outcome": None,
+    # Every permission outcome this adapter process received, in order. The
+    # single-slot field above stays for the Packet 1 tests; a multi-turn
+    # approval test needs the whole sequence.
+    "permission_outcomes": [],
+    "permission_requests": 0,
     "wrote_file": False,
     "grandchild_pid": None,
     # Packet 2 evidence: which sessions this adapter process created vs.
@@ -310,21 +325,60 @@ def _spawn_grandchild() -> None:
     _flush_record()
 
 
+#: A path the permission request reports as a write location while sitting
+#: outside the adapter's workspace. Hermes only ever displays it, so it must
+#: never come into existence — and the user must still be shown it.
+OUTSIDE_WORKSPACE_LOCATION = "/hermes-acp-outside-workspace-should-not-exist.txt"
+
+_permission_request_counter = 0
+
+
 def _handle_permission(session_id: str, msg: dict) -> None:
+    global _permission_request_counter
     target = os.path.join(os.getcwd(), "permission-probe.txt")
-    answer = _ask_client(9101, "session/request_permission", {
-        "sessionId": session_id,
-        "toolCall": {"toolCallId": "tc-write", "title": "Write permission-probe.txt",
-                     "kind": "edit"},
-        "options": [
-            {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+    if _MODE == "permission-no-once":
+        # The only permitting option is a STANDING grant. Answering it would
+        # move policy into the adapter, so Hermes must refuse instead.
+        options = [
+            {"optionId": "allow-always", "name": "Allow always", "kind": "allow_always"},
             {"optionId": "deny", "name": "Deny", "kind": "reject_once"},
-        ],
+        ]
+    else:
+        options = [
+            {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+            {"optionId": "allow-always", "name": "Allow always", "kind": "allow_always"},
+            {"optionId": "deny", "name": "Deny", "kind": "reject_once"},
+        ]
+    _permission_request_counter += 1
+    with _record_lock:
+        _record["permission_requests"] = _permission_request_counter
+    # Flush BEFORE blocking on the answer: a test that waits for "the adapter
+    # has asked" must be able to see it while the request is still open.
+    _flush_record()
+    answer = _ask_client(9100 + _permission_request_counter, "session/request_permission", {
+        "sessionId": session_id,
+        "toolCall": {
+            "toolCallId": "tc-write",
+            # Credential-shaped noise in the human-facing fields: the approval
+            # prompt is user-visible text and must be scrubbed like any other.
+            "title": f"Write permission-probe.txt ({TOOL_OUTPUT_SECRET})",
+            "kind": "edit",
+            "rawInput": {"file_path": target, "token": TOOL_INPUT_SECRET},
+            "locations": [{"path": target}, {"path": OUTSIDE_WORKSPACE_LOCATION}],
+            "_meta": {"claudeCode": {"toolName": "Write"}},
+        },
+        "options": options,
     })
     outcome = (answer.get("result") or {}).get("outcome") or {}
     with _record_lock:
         _record["permission_outcome"] = outcome
-    allowed = outcome.get("outcome") == "selected" and outcome.get("optionId") == "allow"
+        _record["permission_outcomes"].append(outcome)
+    # A real adapter honours whichever permitting option was selected, so this
+    # one does too: the "never hand over a standing grant" invariant is asserted
+    # on the recorded optionId, not smuggled in as a refusal to write.
+    allowed = outcome.get("outcome") == "selected" and outcome.get("optionId") in (
+        "allow", "allow-always",
+    )
     if allowed:
         with open(target, "w", encoding="utf-8") as handle:
             handle.write("written despite policy")
@@ -430,7 +484,7 @@ def _handle_prompt(msg: dict) -> None:
         _send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "refusal"}})
         return
 
-    if _MODE == "permission":
+    if _MODE in ("permission", "permission-no-once"):
         _handle_permission(session_id, msg)
         return
 

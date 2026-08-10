@@ -158,6 +158,25 @@ def _terminate_process_tree(proc: Any, pgid: Optional[int] = None) -> None:
         pass
 
 
+def allow_permission_response(options: list[dict]) -> Optional[dict]:
+    """Build a reply permitting exactly the one action that was asked about.
+
+    Only an ``allow_once`` option is ever selected. A standing adapter-side
+    grant (``allow_always``) would move the policy out of Hermes' view — every
+    later write would be self-approved by the adapter and Hermes would never see
+    the request — and the user approved one action, not a class of them. Durable
+    grants live in Hermes' own session/permanent allowlist instead, where the
+    next request is still visible and still revocable.
+
+    Returns ``None`` when the agent offered no single-shot allow option: there is
+    then nothing Hermes can safely permit, and the caller must deny.
+    """
+    for option in options or []:
+        if option.get("kind") == "allow_once" and option.get("optionId"):
+            return {"outcome": {"outcome": "selected", "optionId": option["optionId"]}}
+    return None
+
+
 def deny_permission_response(options: list[dict]) -> dict:
     """Build a ``session/request_permission`` reply that refuses the action.
 

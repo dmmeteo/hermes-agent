@@ -20,12 +20,18 @@ Scope through Packet 2 (see
 Packet 3 slice 3A adds typed event projection on top of that: tool activity
 reaches the same display callbacks Hermes' own tool loop fires, assistant text
 also streams, thoughts reach the reasoning surface, and token usage reaches
-Hermes' usage accounting. The permission UX is still Packet 3's remaining work
-— every ``session/request_permission`` continues to be denied.
+Hermes' usage accounting.
+
+Slice 3B adds the permission bridge: a ``session/request_permission`` is asked
+of Hermes' existing approval flow (``tools/approval.py``) instead of being
+denied outright, so a write raises a real prompt on whichever surface the
+session is running on. Deny is still what happens whenever that flow cannot
+produce a human answer.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
@@ -34,6 +40,7 @@ from agent.claude_acp_session import ClaudeAcpSession, ClaudeCodeAuthRequired
 
 if TYPE_CHECKING:  # display projection types; no import-time cost
     from agent.transports.claude_acp_event_projector import (
+        PermissionRequest,
         ProjectedEvent,
         ToolActivity,
     )
@@ -43,7 +50,9 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ClaudeCodeAuthRequired",
     "RESEED_MARKER",
+    "RUNTIME_LABEL",
     "make_claude_acp_event_bridge",
+    "make_claude_acp_permission_bridge",
     "resolve_adapter_argv",
     "run_claude_code_acp_turn",
 ]
@@ -237,6 +246,64 @@ def make_claude_acp_event_bridge(agent) -> Callable[["ProjectedEvent"], None]:
         # tool display is a started/completed pair.
 
     return sink
+
+
+# ---------------------------------------------------------------------------
+# Permission bridge — an ACP permission request onto Hermes' approval flow.
+#
+# The adapter owns its own tools, so Hermes' tool loop (and with it
+# `check_all_command_guards`) never sees the write. What Hermes does see is the
+# adapter asking, because `session/set_mode` → `default` keeps the adapter's
+# self-approving classifier out of the decision. This bridge takes that request
+# to the SAME gate a dangerous shell command goes through, which is what makes
+# the prompt appear on whichever surface the session is running on — CLI panel,
+# Discord/Telegram buttons, TUI/desktop prompt — with no per-surface work here.
+#
+# Nothing about the policy lives in this module: mode, allowlists, timeout, and
+# the fail-closed rule are all `tools/approval.py`'s.
+# ---------------------------------------------------------------------------
+
+#: How the runtime names itself in an approval prompt.
+RUNTIME_LABEL = "Claude Code"
+
+
+def make_claude_acp_permission_bridge() -> Callable[["PermissionRequest"], bool]:
+    """Build the ``permission_handler`` that asks the user about one action.
+
+    Returns a callable taking a projected ``PermissionRequest`` and returning
+    True only when the human gate approved it. Called synchronously on the turn
+    thread while the adapter waits, which is what lets the gate resolve
+    per-thread and per-context state on its own — the CLI approval callback, the
+    gateway session key, the interrupt flag. Takes no agent for exactly that
+    reason: there is nothing about this decision that Hermes' approval flow does
+    not already resolve from the ambient session.
+    """
+
+    def handler(request: "PermissionRequest") -> bool:
+        from tools.approval import request_delegated_runtime_approval
+
+        decision = request_delegated_runtime_approval(
+            RUNTIME_LABEL,
+            request.tool_name,
+            request.description,
+            # Grain the allowlist on WHAT was asked, so an `[a]lways` answer
+            # covers this action asked again and nothing else.
+            rule_key=hashlib.sha256(
+                request.signature.encode("utf-8")
+            ).hexdigest()[:16],
+        )
+        approved = bool(decision.get("approved"))
+        if not approved:
+            # The gate's message is written for the model, and the model here is
+            # inside the adapter — which only ever learns "denied" from the
+            # protocol. Log it so the refusal is at least diagnosable.
+            logger.info(
+                "Claude Code ACP: %s was not approved — %s",
+                request.tool_name, decision.get("message") or "no reason given",
+            )
+        return approved
+
+    return handler
 
 
 def _flush_stream_surface(agent) -> None:
@@ -495,6 +562,10 @@ def run_claude_code_acp_turn(
             # session exists.
             cancel_pending=bool(getattr(agent, "_interrupt_requested", False)),
             event_sink=make_claude_acp_event_bridge(agent),
+            # Replaces Packet 1's blanket denial. Absent this handler the
+            # session still denies every request, so the fail-closed default
+            # survives any future caller that forgets to pass it.
+            permission_handler=make_claude_acp_permission_bridge(),
         )
     except TurnLeaseConflict as exc:
         # Refuse rather than spawning a second adapter against a session

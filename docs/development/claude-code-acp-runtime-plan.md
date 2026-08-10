@@ -4,9 +4,11 @@
 remediation pass against an independent review (findings F1–F9, F13, F15).
 Packet 2 complete — see
 [`2026-08-10-claude-code-acp-packet2-report.md`](2026-08-10-claude-code-acp-packet2-report.md).
-Packet 3 **slice 3A (event projection) complete** — see
-[`2026-08-10-claude-code-acp-packet3a-report.md`](2026-08-10-claude-code-acp-packet3a-report.md);
-permission bridging is the remaining Packet 3 work and is not started.
+Packet 3 **slices 3A (event projection) and 3B (permission bridging) complete** —
+see [`2026-08-10-claude-code-acp-packet3a-report.md`](2026-08-10-claude-code-acp-packet3a-report.md)
+and [`2026-08-10-claude-code-acp-packet3b-report.md`](2026-08-10-claude-code-acp-packet3b-report.md);
+cancellation settling and workspace-root negotiation (slice 3C) are the
+remaining Packet 3 work and are not started.
 **Branch:** `feat/claude-code-acp-runtime`
 **Spike report:** [`2026-08-09-claude-code-acp-packet0-spike.md`](2026-08-09-claude-code-acp-packet0-spike.md)
 
@@ -67,6 +69,7 @@ precedent for this shape.
 | Session binding + turn lease | new `agent/claude_acp_binding.py` | ACP session id + lease on the Hermes `sessions.model_config` row (**exists, Packet 2**) |
 | Event projection | new `agent/transports/claude_acp_event_projector.py` | Analogue of `codex_event_projector.py` (**exists, Packet 3A**), consumed through the `event_sink` seam on `ClaudeAcpSession.run_turn` and the bridge in `claude_code_runtime.make_claude_acp_event_bridge` |
 | Wire client | `agent/transports/claude_acp.py` | **Exists (Packet 0)** |
+| Permission bridge | `tools/approval.py::request_delegated_runtime_approval` | **Exists (Packet 3B)** — reuses the shared `_run_approval_gate` decision core; reached through the `permission_handler` seam on `ClaudeAcpSession.run_turn` and `claude_code_runtime.make_claude_acp_permission_bridge` |
 | Provider surface | `plugins/model-providers/claude-code-acp/__init__.py` | `register_provider(ProviderProfile(api_mode="claude_code_acp", auth_type="external_process"))`. NOT `claude-code/` — the `anthropic` profile already owns the `claude-code` alias. |
 | Setup/install UX | `hermes_cli/model_setup_flows.py`, `hermes_cli/claude_acp_install.py` | Adapter presence check + managed install via `hermes model` (NOT `hermes tools`, which only toggles toolsets) |
 
@@ -243,15 +246,19 @@ transcript state into an ACP-side store — that breaks the ownership split.
 **Goal.** Tool activity, approvals, and cancellation behave like native Hermes
 on every surface (CLI, Discord, Telegram).
 
-**Progress.** Slice **3A (event projection) is complete** — see the
-[Packet 3A report](2026-08-10-claude-code-acp-packet3a-report.md). Delivered:
-the first scope bullet below (tool activity, streaming, usage), with credential
+**Progress.** Slices **3A (event projection)** and **3B (permission bridging)**
+are complete — see the
+[Packet 3A report](2026-08-10-claude-code-acp-packet3a-report.md) and the
+[Packet 3B report](2026-08-10-claude-code-acp-packet3b-report.md). 3A delivered
+the first scope bullet below (tool activity, streaming, usage) with credential
 scrubbing on every projected field, and two decisions worth carrying forward —
 per-turn tokens come from the `session/prompt` reply while `usage_update`
 carries context occupancy (never summed), and Hermes' context compressor is
-deliberately not driven on this runtime (closes Packet 2 R5). Still open:
-permission bridging (the blanket denial from Packet 1 stands), the gateway
-guard bypass, and transcript-level tool rows for curator/memory.
+deliberately not driven on this runtime (closes Packet 2 R5). 3B replaced the
+blanket denial with Hermes' own approval gate on every surface, keeping deny as
+the default on every path that cannot produce a human answer, and never handing
+the adapter a standing grant. Still open (slice **3C**): cancellation settling,
+workspace-root negotiation, and transcript-level tool rows for curator/memory.
 
 **Scope.**
 - Project `tool_call` / `tool_call_update` into Hermes' tool-activity display;
@@ -262,6 +269,7 @@ guard bypass, and transcript-level tool rows for curator/memory.
   and the `gateway/run.py` runner) — both must be bypassed for approvals.
   **This replaces Packet 1's blanket denial**; the explicit `session/set_mode`
   → `default` negotiation already landed in Packet 1 and must stay.
+  ✅ **slice 3B**
 - Interrupt → `session/cancel`; the turn must settle as `cancelled` and
   release its lease.
 - Workspace containment via session `cwd` + `additionalDirectories`, **not**
