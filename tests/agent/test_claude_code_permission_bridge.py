@@ -195,7 +195,13 @@ class TestApprovalGranted:
 
         text = surface.text
         assert "Claude Code" in text, "the user must know who is asking"
-        assert "Write" in text, "the user must know which tool wants to run"
+        # The qualified label, not a bare "Write" the *title* would satisfy on
+        # its own: 0.66.0 sends no tool name on a top-level permission request,
+        # so this asserts the name was recovered from the tool call the adapter
+        # emitted first rather than falling back to the ACP kind ("edit").
+        assert "Claude Code: Write" in text, (
+            "the user must know which tool wants to run"
+        )
         assert "permission-probe.txt" in text, "the user must see the target"
 
     def test_the_adapter_is_never_handed_a_standing_grant(
@@ -529,6 +535,225 @@ def _write(path, **extra):
     )
 
 
+class TestUnconditionalFloor:
+    """The two checks that fire BEFORE the yolo bypass must reach this runtime.
+
+    ``check_dangerous_command`` runs ``detect_hardline_command`` and
+    ``_match_user_deny_rule`` ahead of the ``--yolo`` / ``approvals.mode=off``
+    bypass, and ``_user_deny_block_result`` promises the user their deny rule
+    holds "not even with --yolo". A delegated runtime asks over a protocol
+    instead of through Hermes' tool loop, so the floor has to be re-applied at
+    the point where that ask is decided — otherwise Hermes' own shell tool
+    refuses ``rm -rf /`` unconditionally while the same action routed through
+    Claude Code is auto-approved.
+
+    The floor measures what the runtime *declared*, not the scrubbed and
+    truncated display text: a redacted or cut command string is not the command
+    the agent asked to run.
+    """
+
+    def test_a_hardline_command_is_blocked_even_under_yolo(
+        self, approval_state, monkeypatch
+    ):
+        monkeypatch.setattr(approval_state, "_YOLO_MODE_FROZEN", True)
+
+        decision = approval_state.request_delegated_runtime_approval(
+            "Claude Code", "Bash", "rm -rf /", declared_command="rm -rf /",
+        )
+
+        assert decision["approved"] is False
+        assert decision.get("hardline") is True
+        assert "--yolo" in decision["message"]
+
+    def test_a_declared_command_matching_a_deny_rule_is_blocked_under_yolo(
+        self, approval_state, monkeypatch
+    ):
+        monkeypatch.setattr(approval_state, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setattr(
+            approval_state, "_get_approval_config",
+            lambda: {"deny": ["*git push --force*"]},
+        )
+
+        decision = approval_state.request_delegated_runtime_approval(
+            "Claude Code", "Bash", "git push --force",
+            declared_command="git push --force origin main",
+        )
+
+        assert decision["approved"] is False
+        assert decision.get("user_deny") is True
+
+    def test_a_declared_path_matching_a_deny_rule_is_blocked(
+        self, approval_state, monkeypatch
+    ):
+        """A deny glob the user wrote against their private keys must cover a
+        delegated Write of them, not just a shell command that names them."""
+        monkeypatch.setattr(approval_state, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setattr(
+            approval_state, "_get_approval_config",
+            lambda: {"deny": ["*/.ssh/*"]},
+        )
+
+        decision = approval_state.request_delegated_runtime_approval(
+            "Claude Code", "Write", "edit a key",
+            declared_paths=("/home/u/.ssh/authorized_keys",),
+        )
+
+        assert decision["approved"] is False
+        assert decision.get("user_deny") is True
+
+    def test_a_path_that_merely_reads_like_a_hardline_command_is_not_blocked(
+        self, approval_state, monkeypatch
+    ):
+        """The hardline blocklist is written against shell syntax, so it is not
+        applied to bare paths: ``/w/mkfs-notes.md`` matches the ``mkfs`` pattern
+        and blocking it would refuse an ordinary edit with no way to override.
+        """
+        monkeypatch.setattr(approval_state, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setattr(approval_state, "_get_approval_config", lambda: {})
+
+        decision = approval_state.request_delegated_runtime_approval(
+            "Claude Code", "Write", "write notes",
+            declared_paths=("/w/mkfs-notes.md",),
+        )
+
+        assert decision["approved"] is True
+
+    def test_the_bridge_applies_the_floor_to_a_projected_request(
+        self, approval_state, monkeypatch
+    ):
+        """End of the chain: projection → bridge → gate, under ``--yolo``."""
+        monkeypatch.setattr(approval_state, "_YOLO_MODE_FROZEN", True)
+        from agent.claude_code_runtime import make_claude_acp_permission_bridge
+        from agent.transports.claude_acp_event_projector import (
+            project_permission_request,
+        )
+
+        handler = make_claude_acp_permission_bridge()
+        request = project_permission_request(_params(
+            kind="execute", title="rm -rf /",
+            rawInput={"command": "rm -rf /"},
+        ))
+
+        assert handler(request) is False, (
+            "the hardline floor did not reach the delegated runtime: --yolo "
+            "auto-approved an unconditionally blocked command"
+        )
+
+    def test_yolo_still_bypasses_the_recoverable_approval_layer(
+        self, approval_state, monkeypatch
+    ):
+        """The floor must not turn into a second approval prompt: an ordinary
+        command under yolo still goes through without asking anyone."""
+        monkeypatch.setattr(approval_state, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setattr(approval_state, "_get_approval_config", lambda: {})
+        from agent.claude_code_runtime import make_claude_acp_permission_bridge
+        from agent.transports.claude_acp_event_projector import (
+            project_permission_request,
+        )
+
+        handler = make_claude_acp_permission_bridge()
+        request = project_permission_request(_params(
+            kind="execute", title="pytest -x",
+            rawInput={"command": "pytest -x"},
+        ))
+
+        assert handler(request) is True
+
+
+class TestToolNamingIsHonest:
+    """The prompt names the tool the adapter declared, or says nothing it cannot
+    back.
+
+    Adapter 0.66.0 stamps ``_meta.claudeCode.toolName`` on a permission request
+    **only** when the tool call has a parent (a sub-agent's tool use). For a
+    top-level call the meta block is absent — but the adapter always emits the
+    referenced ``tool_call`` update *first*, and that update carries the name.
+    JSON-RPC over one stdio stream is ordered, so by the time the permission
+    request is decided the name is already known.
+    """
+
+    def test_a_top_level_request_is_named_from_the_declared_tool_call(self):
+        from agent.transports.claude_acp_event_projector import (
+            ClaudeAcpEventProjector,
+            project_permission_request,
+        )
+
+        projector = ClaudeAcpEventProjector()
+        projector.project({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-1",
+            "kind": "execute",
+            "title": "rm -rf /tmp/x",
+            "rawInput": {"command": "rm -rf /tmp/x"},
+            "_meta": {"claudeCode": {"toolName": "Bash"}},
+        })
+
+        request = project_permission_request(
+            _params(
+                toolCallId="tc-1", kind="execute", title="rm -rf /tmp/x",
+                rawInput={"command": "rm -rf /tmp/x"},
+            ),
+            tool_name_hint=projector.declared_tool_name("tc-1"),
+        )
+
+        assert request.tool_name == "Bash", (
+            "the prompt named the ACP *kind* rather than the tool the adapter "
+            "said it was running"
+        )
+
+    def test_a_parented_request_still_reads_its_own_meta(self):
+        from agent.transports.claude_acp_event_projector import (
+            project_permission_request,
+        )
+
+        request = project_permission_request(_params(
+            _meta={"claudeCode": {"toolName": "Write", "parentToolUseId": "p1"}},
+            kind="edit", title="Write a.py",
+        ))
+
+        assert request.tool_name == "Write"
+
+    def test_an_unknown_tool_call_falls_back_to_the_kind(self):
+        """No declared name anywhere: the kind is what we can honestly say."""
+        from agent.transports.claude_acp_event_projector import (
+            project_permission_request,
+        )
+
+        request = project_permission_request(
+            _params(toolCallId="tc-unseen", kind="edit", title="Write a.py"),
+            tool_name_hint="",
+        )
+
+        assert request.tool_name == "edit"
+
+    def test_a_subagent_request_names_its_tool_end_to_end(
+        self, tmp_path, monkeypatch, cli_surface
+    ):
+        """The parented shape, driven through a real adapter subprocess."""
+        surface = cli_surface("deny")
+        agent = _agent_with(tmp_path, "permission-subagent", monkeypatch)
+        try:
+            agent.run_conversation("please write a file")
+        finally:
+            agent.close()
+
+        assert surface.prompts, "the approval surface was never reached"
+        assert "Write" in surface.text
+
+    def test_a_declared_name_is_not_invented_for_an_unrelated_call(self):
+        from agent.transports.claude_acp_event_projector import (
+            ClaudeAcpEventProjector,
+        )
+
+        projector = ClaudeAcpEventProjector()
+        projector.project({
+            "sessionUpdate": "tool_call", "toolCallId": "tc-1", "kind": "read",
+            "_meta": {"claudeCode": {"toolName": "Read"}},
+        })
+
+        assert projector.declared_tool_name("tc-2") == ""
+
+
 class TestGrantGrain:
     """``[a]lways`` must cover the action it was answered for, and no other.
 
@@ -599,6 +824,87 @@ class TestGrantGrain:
         assert first.signature != second.signature, (
             "a grant for one bulk edit must not cover a different one"
         )
+
+    def test_signatures_differ_past_the_display_truncation(self):
+        """Identity is computed over the DECLARED paths, not their display form.
+
+        Display paths are scrubbed and cut to ``_MAX_PREVIEW_CHARS``. Two files
+        under a common prefix longer than that render identically, so hashing the
+        display view makes one ``[a]lways`` answer blanket every sibling.
+        """
+        from agent.transports.claude_acp_event_projector import (
+            _MAX_PREVIEW_CHARS,
+            project_permission_request,
+        )
+
+        deep = "/workspace/" + "a" * (_MAX_PREVIEW_CHARS + 10) + "/"
+        first = project_permission_request(_params(
+            kind="edit", title="bulk edit",
+            locations=[{"path": deep + "alpha.py"}],
+        ))
+        second = project_permission_request(_params(
+            kind="edit", title="bulk edit",
+            locations=[{"path": deep + "beta.py"}],
+        ))
+
+        assert first.locations == second.locations, "same displayed slice"
+        assert first.signature != second.signature, (
+            "a grant for one deep path silently blanketed its siblings"
+        )
+
+    def test_signatures_differ_past_the_argument_truncation(self):
+        """Same for ``rawInput``: the declared argument, not the cut one."""
+        from agent.transports.claude_acp_event_projector import (
+            _MAX_ARG_CHARS,
+            project_permission_request,
+        )
+
+        head = "echo " + "x" * (_MAX_ARG_CHARS + 10)
+        first = project_permission_request(_params(
+            kind="execute", title="a long command",
+            rawInput={"command": head + " > one.txt"},
+        ))
+        second = project_permission_request(_params(
+            kind="execute", title="a long command",
+            rawInput={"command": head + " > two.txt"},
+        ))
+
+        assert first.args == second.args, "same displayed arguments"
+        assert first.signature != second.signature
+
+    def test_two_asks_differing_only_inside_a_redacted_segment_differ(self):
+        """Redaction is the second way the display view collapses two actions."""
+        from agent.transports.claude_acp_event_projector import (
+            project_permission_request,
+        )
+
+        first = project_permission_request(_params(
+            kind="edit", title="write a token file",
+            locations=[{"path": "/w/sk-ant-api03-" + "A" * 40 + "/f.py"}],
+        ))
+        second = project_permission_request(_params(
+            kind="edit", title="write a token file",
+            locations=[{"path": "/w/sk-ant-api03-" + "B" * 40 + "/f.py"}],
+        ))
+
+        assert first.signature != second.signature
+
+    def test_the_signature_carries_no_declared_material(self):
+        """It is an identity, and it is derived from raw values — so it must be
+        opaque. A signature that quoted its inputs would put a credential from
+        ``rawInput`` into whatever a caller logs it with."""
+        from agent.transports.claude_acp_event_projector import (
+            project_permission_request,
+        )
+
+        request = project_permission_request(_params(
+            kind="execute", title="deploy",
+            rawInput={"command": f"deploy --token {TOOL_INPUT_SECRET}"},
+            locations=[{"path": "/w/secrets.env"}],
+        ))
+
+        assert TOOL_INPUT_SECRET not in request.signature
+        assert "/w/secrets.env" not in request.signature
 
     def test_a_session_grant_for_one_action_does_not_approve_another(
         self, approval_state, monkeypatch

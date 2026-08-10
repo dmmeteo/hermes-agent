@@ -212,11 +212,17 @@ class ClaudeAcpClient:
         if not command:
             raise ValueError("command must be a non-empty argv list")
 
-        # The ACP adapter drives real model calls, so it legitimately needs
-        # provider credentials (inherit_credentials=True). The helper still
-        # strips Tier-1 Hermes secrets — gateway bot tokens, GitHub auth,
-        # infra tokens — which a coding subprocess has no use for.
-        spawn_env = hermes_subprocess_env(inherit_credentials=True)
+        # The adapter needs exactly ONE credential — the Claude subscription
+        # token — so it is spawned with the narrow posture rather than the
+        # provider-credential-inheriting one. `CLAUDE_CODE_OAUTH_TOKEN` survives
+        # `inherit_credentials=False` because it is deliberately excluded from
+        # the Tier-2 blocklist (`tools/environments/local.py`), which is the
+        # exact pattern that helper's docstring recommends for a caller needing
+        # one specific secret. Everything else Tier-2 covers — every other
+        # provider key, every tool secret — is stripped: this child is a Node
+        # process whose `Bash` tool executes model-authored commands, and a key
+        # it never uses is only reachable from that shell.
+        spawn_env = hermes_subprocess_env(inherit_credentials=False)
         if env:
             spawn_env.update(env)
         # Popped, not blanked: the adapter treats an empty-string key as

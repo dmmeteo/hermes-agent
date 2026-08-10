@@ -26,9 +26,16 @@ than incidental:
 * **assistant text is an allow-list of exactly one event kind.** Anything new
   the adapter starts emitting — a replayed ``user_message_chunk``, a plan, a
   slash-command catalogue — is ignored by default, not appended to the reply.
-* **every field that leaves this module is credential-scrubbed**, because tool
-  payloads are the one place a real key legitimately appears (a ``Bash``
-  command line, an edited ``.env``) and every projected field is display-bound.
+* **every *display* field that leaves this module is credential-scrubbed**,
+  because tool payloads are the one place a real key legitimately appears (a
+  ``Bash`` command line, an edited ``.env``) and a projected display field ends
+  up in a transcript or a chat message. The two exceptions are named and narrow:
+  ``PermissionRequest.declared_command`` / ``.declared_paths`` are raw and are
+  never rendered — the unconditional approval floor has to measure what the agent
+  declared, not a redacted rendering of it. Assistant reply text is likewise
+  accumulated raw (``_project_text``), because the response Hermes returns must
+  be byte-identical to what the model said; the streaming surfaces apply their
+  own scrubbers downstream.
 
 Scrubbing runs before truncation: cutting first can split a secret into a
 prefix the redactor no longer recognises.
@@ -36,11 +43,12 @@ prefix the redactor no longer recognises.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -218,11 +226,20 @@ def _location_pairs(payload: Dict[str, Any]) -> List[tuple]:
 class PermissionRequest:
     """One ``session/request_permission``, as a human approval surface sees it.
 
-    Display-bound and already scrubbed: this is the record that becomes the text
-    of a CLI prompt or a Discord/Telegram approval message, so nothing on it may
-    carry a credential or an unbounded payload. The protocol ``options`` are
-    deliberately NOT here — answering the wire is the session's job, and the
-    approval surface has no business choosing an ``optionId``.
+    Every *display* field is already scrubbed and bounded: this is the record
+    that becomes the text of a CLI prompt or a Discord/Telegram approval
+    message, so nothing rendered from it may carry a credential or an unbounded
+    payload. The protocol ``options`` are deliberately NOT here — answering the
+    wire is the session's job, and the approval surface has no business choosing
+    an ``optionId``.
+
+    Two fields (``declared_command``, ``declared_paths``) are deliberately
+    **raw**, and are never rendered. They exist for the unconditional policy
+    floor in ``tools/approval.py``, which has to measure what the agent declared
+    rather than a redacted, truncated rendering of it — the same reason the
+    workspace-root check uses the declared path (see :func:`_location_pairs`). A
+    surface that prints this record wholesale would defeat that; print
+    :attr:`description` instead, which is what the prompt is for.
     """
 
     tool_name: str
@@ -240,10 +257,23 @@ class PermissionRequest:
     #: supplied: with nothing to compare against there is no basis for the
     #: claim, and labelling everything "outside" trains the user to ignore it.
     outside_roots: tuple = ()
-    #: Stable-per-request identity for Hermes' allowlist grain: two requests that
-    #: describe the same action share it, so ``[a]lways`` cannot blanket a
-    #: different action on the same tool.
+    #: How many *further* declared paths fall outside the roots but sit past the
+    #: displayed slice. Since containment is marked rather than refused, the
+    #: marker is the whole protection: a bulk edit whose ninth path leaves the
+    #: workspace must not be presented as staying inside it.
+    outside_roots_hidden: int = 0
+    #: Opaque stable-per-request identity for Hermes' allowlist grain: two
+    #: requests that describe the same action share it, so ``[a]lways`` cannot
+    #: blanket a different action on the same tool. A digest of the *declared*
+    #: values, so it neither collides on two actions that merely display alike
+    #: nor carries the material it was computed from.
     signature: str = ""
+    #: Raw declared shell command, when the tool declared one. Policy input
+    #: only — never displayed.
+    declared_command: str = ""
+    #: Every raw declared path, in declaration order. Policy input only — never
+    #: displayed.
+    declared_paths: tuple = ()
 
     @property
     def description(self) -> str:
@@ -264,70 +294,133 @@ class PermissionRequest:
             # The workspace is what the session negotiated; a path outside it is
             # the difference between "edit my project" and "edit my home
             # directory", and the user cannot weigh that from the path alone.
+            marker = "outside the workspace: " + ", ".join(self.outside_roots)
+            if self.outside_roots_hidden:
+                marker += f" (+{self.outside_roots_hidden} more outside the workspace)"
+            parts.append(marker)
+        elif self.outside_roots_hidden:
+            # None of the *shown* paths is outside, but some of the ones the
+            # prompt had to omit are. Saying nothing would present a write that
+            # leaves the workspace as one that stays inside it.
             parts.append(
-                "outside the workspace: " + ", ".join(self.outside_roots)
+                f"{self.outside_roots_hidden} more outside the workspace"
             )
         return "; ".join(parts) or f"{self.tool_name} requested permission"
 
 
-def project_permission_request(
-    params: Dict[str, Any], roots: Optional[List[str]] = None
-) -> PermissionRequest:
-    """Project ``session/request_permission`` params into a display record.
+def _declared_command(tool_call: Dict[str, Any], kind_raw: str) -> str:
+    """The raw shell command a tool declared, or ``""``.
 
-    Every field is credential-scrubbed and bounded before truncation, exactly as
-    for a projected update — an approval prompt is user-visible text, and on a
-    messaging platform it leaves the machine.
+    ``Bash`` carries it in ``rawInput.command``; the adapter also copies it
+    verbatim into ``title`` (``dist/tools.js``, ``case "Bash"``), which is the
+    fallback when a future tool declares a command without naming the field.
+    The title is only trusted for the ``execute`` kind — a ``Write``'s title is
+    prose ("Write a.py"), not a command, and feeding prose to a shell-syntax
+    detector invites blocks nobody can explain.
+    """
+    raw_input = tool_call.get("rawInput")
+    if isinstance(raw_input, dict):
+        command = raw_input.get("command")
+        if isinstance(command, str) and command.strip():
+            return command
+    if kind_raw == "execute":
+        title = tool_call.get("title")
+        if isinstance(title, str) and title.strip():
+            return title
+    return ""
+
+
+def project_permission_request(
+    params: Dict[str, Any],
+    roots: Optional[List[str]] = None,
+    tool_name_hint: str = "",
+) -> PermissionRequest:
+    """Project ``session/request_permission`` params into an approval record.
+
+    Every *display* field is credential-scrubbed and bounded before truncation,
+    exactly as for a projected update — an approval prompt is user-visible text,
+    and on a messaging platform it leaves the machine. The record additionally
+    carries the raw declared command/paths for the policy floor; see
+    :class:`PermissionRequest`.
 
     ``roots`` are the session's negotiated workspace directories. When supplied,
-    declared paths are classified against them so the prompt can say which ones
-    fall outside. Classification only: nothing here opens, reads, or creates a
-    path, and a path outside the roots is still shown to the user rather than
-    silently dropped.
+    **every** declared path is classified against them so the prompt can say
+    which ones fall outside — including the ones the prompt has no room to list,
+    which are reported as a count. Classification only: nothing here opens,
+    reads, or creates a path, and a path outside the roots is still shown to the
+    user rather than silently dropped.
+
+    ``tool_name_hint`` is the tool name the adapter declared on the ``tool_call``
+    this request refers to. Adapter 0.66.0 stamps ``_meta.claudeCode.toolName``
+    on a permission request only for a *parented* (sub-agent) call, so for an
+    ordinary top-level Bash/Write there is no name in these params at all — but
+    the adapter always emits the referenced ``tool_call`` first, and that update
+    does carry it. Passing it in is how the prompt names the tool that is
+    actually running instead of the ACP *kind* ("execute", "edit"). Absent both,
+    the kind is what can honestly be said.
     """
     tool_call = params.get("toolCall")
     if not isinstance(tool_call, dict):
         tool_call = {}
     title_raw = tool_call.get("title")
+    title_raw = title_raw.strip() if isinstance(title_raw, str) else ""
     title = (
-        _truncate(_scrub_text(title_raw.strip()), _MAX_PREVIEW_CHARS)
-        if isinstance(title_raw, str) and title_raw.strip()
+        _truncate(_scrub_text(title_raw), _MAX_PREVIEW_CHARS) if title_raw else ""
+    )
+    kind_value = tool_call.get("kind")
+    kind_raw = kind_value.strip() if isinstance(kind_value, str) else ""
+    kind = _truncate(_scrub_text(kind_raw), _MAX_PREVIEW_CHARS) if kind_raw else ""
+    hint = (
+        _truncate(_scrub_text(tool_name_hint.strip()), _MAX_PREVIEW_CHARS)
+        if isinstance(tool_name_hint, str) and tool_name_hint.strip()
         else ""
     )
-    kind_raw = tool_call.get("kind")
-    kind = (
-        _truncate(_scrub_text(kind_raw.strip()), _MAX_PREVIEW_CHARS)
-        if isinstance(kind_raw, str) and kind_raw.strip()
-        else ""
-    )
-    name = _declared_tool_name(tool_call) or kind or "tool"
-    args = _as_args(tool_call.get("rawInput"))
+    name = _declared_tool_name(tool_call) or hint or kind or "tool"
+    raw_input = tool_call.get("rawInput")
+    args = _as_args(raw_input)
     pairs = _location_pairs(tool_call)
+    declared_raw = tuple(raw for raw, _display in pairs)
     declared = [display for _raw, display in pairs]
-    # Display is bounded; identity is not. A tool touching 400 files must not
-    # turn the prompt into a wall of paths, but the paths it does not show still
-    # have to reach the signature — otherwise two different mass edits sharing
-    # their first eight paths would share one remembered grant.
+    # Display is bounded; classification and identity are not. A tool touching
+    # 400 files must not turn the prompt into a wall of paths, but every path it
+    # declared still has to be measured against the roots and reach the
+    # signature — otherwise a mass edit's ninth path could leave the workspace
+    # unremarked, and two different mass edits sharing their first eight paths
+    # would share one remembered grant.
     shown = declared[:_MAX_LOCATIONS]
     outside: tuple = ()
+    outside_hidden = 0
     if roots:
         from agent.claude_acp_workspace import is_within_roots
 
-        outside = tuple(
-            display for raw, display in pairs[:_MAX_LOCATIONS]
+        outside_all: List[Tuple[int, str]] = [
+            (index, display)
+            for index, (raw, display) in enumerate(pairs)
             if not is_within_roots(raw, roots)
+        ]
+        outside = tuple(
+            display for index, display in outside_all if index < _MAX_LOCATIONS
+        )
+        outside_hidden = sum(
+            1 for index, _display in outside_all if index >= _MAX_LOCATIONS
         )
     # Identity is derived from WHAT is being asked, never from the adapter's
     # per-call ``toolCallId``: a remembered grant must apply to the same action
-    # asked again, and must not apply to a different one.
+    # asked again, and must not apply to a different one. It is computed over
+    # the DECLARED values — the display view is scrubbed and truncated, so two
+    # sibling files under a long common prefix, or two paths differing only
+    # inside a secret-shaped segment, render identically and would share one
+    # grant. The result is a digest, so the raw material it distinguishes on is
+    # not carried around by the record.
     try:
-        signature = json.dumps(
-            {"tool": name, "kind": kind, "title": title,
-             "locations": declared, "args": args},
+        material = json.dumps(
+            {"tool": name, "kind": kind_raw, "title": title_raw,
+             "locations": list(declared_raw), "args": raw_input},
             ensure_ascii=False, sort_keys=True, default=str,
         )
     except (TypeError, ValueError):
-        signature = f"{name}|{kind}|{title}|{declared}"
+        material = f"{name}|{kind_raw}|{title_raw}|{declared_raw}|{raw_input!r}"
+    signature = hashlib.sha256(material.encode("utf-8", "replace")).hexdigest()
     return PermissionRequest(
         tool_name=name,
         title=title,
@@ -336,7 +429,10 @@ def project_permission_request(
         locations=shown,
         omitted_locations=len(declared) - len(shown),
         outside_roots=outside,
+        outside_roots_hidden=outside_hidden,
         signature=signature,
+        declared_command=_declared_command(tool_call, kind_raw),
+        declared_paths=declared_raw,
     )
 
 
@@ -401,6 +497,11 @@ class ClaudeAcpEventProjector:
         self._clock = clock
         self._text_parts: List[str] = []
         self._tools: Dict[str, ToolActivity] = {}
+        #: ``toolCallId`` → the tool name the adapter declared for it. Kept
+        #: separately from ``_tools`` because it is only ever the adapter's OWN
+        #: name, never a kind fallback — a permission prompt asking about the
+        #: wrong tool is worse than one that names the kind honestly.
+        self._declared_names: Dict[str, str] = {}
         self.tool_iterations = 0
         self.usage: Optional[UsageSnapshot] = None
 
@@ -410,6 +511,16 @@ class ClaudeAcpEventProjector:
     def assistant_text(self) -> str:
         """The reply, assembled from assistant text chunks only."""
         return "".join(self._text_parts)
+
+    def declared_tool_name(self, tool_call_id: str) -> str:
+        """The tool name the adapter declared for ``tool_call_id``, or ``""``.
+
+        The permission path's honest answer to a request that carries no
+        ``_meta`` of its own: the adapter emits the referenced ``tool_call``
+        before it asks (``ensureToolCallEmitted``), and that update always
+        carries the name. Nothing is invented for a call never seen.
+        """
+        return self._declared_names.get(str(tool_call_id or ""), "")
 
     # ---------- projection ----------
 
@@ -459,15 +570,25 @@ class ClaudeAcpEventProjector:
         self._text_parts.append(text)
         return ProjectedEvent(kind="text", text=text)
 
-    def _tool_name(self, payload: Dict[str, Any], existing: Optional[ToolActivity]) -> str:
+    def _tool_name(
+        self,
+        payload: Dict[str, Any],
+        existing: Optional[ToolActivity],
+        call_id: str = "",
+    ) -> str:
         """Display name for a tool call.
 
         Prefers the adapter's own ``_meta.claudeCode.toolName`` (``Read``,
         ``Bash``, ``Edit``, …) — that is the tool that actually ran, and naming
-        it honestly beats mapping it onto a Hermes tool that did not.
+        it honestly beats mapping it onto a Hermes tool that did not. A declared
+        name is also remembered against its ``toolCallId`` so an approval prompt
+        for the same call can name the tool even though the permission request
+        itself carries no ``_meta`` (see :meth:`declared_tool_name`).
         """
         declared = _declared_tool_name(payload)
         if declared:
+            if call_id:
+                self._declared_names[call_id] = declared
             return declared
         if existing is not None and existing.name:
             return existing.name
@@ -496,7 +617,7 @@ class ClaudeAcpEventProjector:
         args = _as_args(payload.get("rawInput"))
         activity = ToolActivity(
             call_id=deterministic_call_id(call_id),
-            name=self._tool_name(payload, None),
+            name=self._tool_name(payload, None, call_id),
             args=args,
             preview=self._preview(payload, args),
             kind=str(payload.get("kind") or ""),
@@ -523,7 +644,7 @@ class ClaudeAcpEventProjector:
             # is not silently dropped.
             activity = ToolActivity(
                 call_id=deterministic_call_id(call_id),
-                name=self._tool_name(payload, None),
+                name=self._tool_name(payload, None, call_id),
                 kind=str(payload.get("kind") or ""),
                 status=status or "in_progress",
                 started_at=self._clock(),

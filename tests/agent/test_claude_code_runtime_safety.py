@@ -59,6 +59,21 @@ def _agent_with(tmp_path, mode, monkeypatch, record=None):
     return a
 
 
+@pytest.fixture
+def record_env(monkeypatch):
+    """Ask the fake adapter to report extra env vars in ``inherited_env``.
+
+    The adapter records only what it was told to watch, so a test asserting
+    "this secret did not reach the child" names the var itself rather than
+    growing a hardcoded provider list inside the fake.
+    """
+
+    def _watch(*names):
+        monkeypatch.setenv("FAKE_ACP_WATCH_ENV", ",".join(names))
+
+    return _watch
+
+
 def _pid_alive(pid: int) -> bool:
     # psutil, not os.kill(pid, 0): on Windows that signals CTRL_C_EVENT to the
     # target's console group rather than probing liveness (bpo-14484).
@@ -247,6 +262,50 @@ class TestAdapterChildEnvironment:
             "CLAUDE_CODE_OAUTH_TOKEN is the `claude setup-token` subscription "
             "credential; stripping it breaks auth on headless gateway/cron hosts"
         )
+
+    @pytest.mark.parametrize(
+        "var", ["OPENAI_API_KEY", "OPENROUTER_API_KEY", "BRAVE_SEARCH_API_KEY"]
+    )
+    def test_unrelated_provider_and_tool_secrets_do_not_reach_the_child(
+        self, tmp_path, monkeypatch, record_env, var
+    ):
+        """M2 — the adapter needs exactly one credential, not the whole wallet.
+
+        The child is a Node process whose ``Bash`` tool executes model-authored
+        commands. Every other provider key and tool secret in Hermes' env is
+        reachable from that shell for no benefit: the Claude Code provider
+        authenticates with the subscription token, which survives
+        ``inherit_credentials=False`` because it is deliberately excluded from
+        the blocklist.
+        """
+        record_env(var)
+        monkeypatch.setenv(var, "sentinel-should-not-reach-adapter")
+        record = tmp_path / "record.json"
+        agent = _agent_with(tmp_path, "normal", monkeypatch, record)
+
+        agent.run_conversation("hello")
+
+        data = json.loads(record.read_text(encoding="utf-8"))
+        assert data["inherited_env"][var] is None, (
+            f"{var} reached the Claude Code adapter, whose shell tool runs "
+            "model-authored commands"
+        )
+
+    def test_the_subscription_token_survives_the_narrower_posture(
+        self, tmp_path, monkeypatch, record_env
+    ):
+        """The pair that makes M2 safe: one secret in, everything else out."""
+        record_env("OPENAI_API_KEY")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-KEEP-ME")
+        monkeypatch.setenv("OPENAI_API_KEY", "sentinel-should-not-reach-adapter")
+        record = tmp_path / "record.json"
+        agent = _agent_with(tmp_path, "normal", monkeypatch, record)
+
+        agent.run_conversation("hello")
+
+        data = json.loads(record.read_text(encoding="utf-8"))
+        assert data["inherited_env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-KEEP-ME"
+        assert data["inherited_env"]["OPENAI_API_KEY"] is None
 
     def test_stripping_does_not_mutate_the_parent_environment(self, tmp_path, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "parent-must-keep-this")

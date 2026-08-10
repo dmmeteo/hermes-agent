@@ -490,7 +490,11 @@ class TestTheUserSeesTheRequest:
             payload = turn.notifications[0]
             text = json.dumps(payload)
             assert "Claude Code" in text
-            assert "Write" in text
+            # Qualified, so the assertion cannot be satisfied by the tool
+            # *title* alone: adapter 0.66.0 omits the tool name on a top-level
+            # permission request, and the name here is the one Hermes recovered
+            # from the `tool_call` update the adapter sent first.
+            assert "Claude Code: Write" in text
             assert "permission-probe.txt" in text
             assert TOOL_INPUT_SECRET not in text
             assert TOOL_OUTPUT_SECRET not in text

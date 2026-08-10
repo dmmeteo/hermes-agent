@@ -307,6 +307,13 @@ def make_claude_acp_permission_bridge(
             rule_key=hashlib.sha256(
                 request.signature.encode("utf-8")
             ).hexdigest()[:16],
+            # The unconditional floor — the hardline blocklist and the user's
+            # `approvals.deny` rules — is measured on what the runtime DECLARED,
+            # not on the scrubbed/truncated prompt text. Without these two
+            # arguments the gate's yolo bypass would auto-approve a command
+            # Hermes' own shell tool refuses outright.
+            declared_command=request.declared_command,
+            declared_paths=request.declared_paths,
         )
         approved = bool(decision.get("approved"))
         if not approved:
@@ -715,6 +722,7 @@ def run_claude_code_acp_turn(
         "partial": cancelled or error is not None,
         "interrupted": _user_interrupted,
         **({"interrupt_message": _interrupt_message} if _interrupt_message else {}),
+        **_steer_handoff(agent),
         "error": error,
         # We flushed the assistant message ourselves above, so the gateway
         # must not write it again — append_message has no dedup and a second
@@ -785,6 +793,31 @@ def _run_improvement_hooks(
             logger.debug("background review spawn raised", exc_info=True)
 
 
+def _steer_handoff(agent) -> Dict[str, Any]:
+    """Hand a pending ``/steer`` back to the caller, or ``{}``.
+
+    ``AIAgent.steer()`` returns True and parks the text in ``_pending_steer``,
+    and every surface reports that as accepted. On the chat-completions path the
+    text is drained onto the next tool result; on THIS path there is no next tool
+    result — the adapter owns its own loop — and all three drains
+    (``conversation_loop``, the tool-result applier, ``turn_finalizer``) sit
+    behind the delegated early return. So the guidance would be dropped after
+    the user was told it landed.
+
+    ``result["pending_steer"]`` is the finalizer's own answer for exactly this
+    shape ("a steer with no tool batch left to drain into"), and the CLI, the
+    gateway and the TUI already deliver that key as the next user turn. Reusing
+    it keeps role alternation intact — the text becomes a real next turn, never
+    a synthetic message spliced into this one.
+    """
+    try:
+        leftover = agent._drain_pending_steer()
+    except Exception:
+        logger.debug("draining a pending steer raised", exc_info=True)
+        return {}
+    return {"pending_steer": leftover} if leftover else {}
+
+
 def _persist(agent, messages: List[Dict[str, Any]]) -> None:
     """Flush projected messages; this path bypasses the loop's persistence."""
     if getattr(agent, "_session_db", None) is None:
@@ -822,5 +855,7 @@ def _failure_result(
         "partial": True,
         "interrupted": _user_interrupted,
         **({"interrupt_message": _interrupt_message} if _interrupt_message else {}),
+        # A setup/protocol failure must not eat the user's guidance either.
+        **_steer_handoff(agent),
         "error": message,
     }

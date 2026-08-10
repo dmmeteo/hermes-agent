@@ -532,6 +532,63 @@ class TestPermissionLocations:
         assert request.outside_roots == ()
         assert "outside the workspace" not in request.description.lower()
 
+    def test_an_out_of_root_path_past_the_displayed_slice_is_still_reported(
+        self, tmp_path
+    ):
+        """"Mark, don't refuse" makes the marker the entire protection, so it
+        cannot be computed over the displayed slice only: a bulk edit whose
+        ninth path leaves the workspace would be approved with no indication.
+        """
+        from agent.transports.claude_acp_event_projector import (
+            _MAX_LOCATIONS,
+            project_permission_request,
+        )
+
+        inside = [{"path": str(tmp_path / f"f{i}.py")} for i in range(_MAX_LOCATIONS)]
+        request = project_permission_request(
+            {"toolCall": {
+                "_meta": {"claudeCode": {"toolName": "Edit"}},
+                "title": "Edit many",
+                "locations": inside + [{"path": "/etc/passwd"}],
+            }},
+            roots=[str(tmp_path)],
+        )
+
+        assert request.outside_roots == (), "the shown paths are all in-root"
+        assert request.outside_roots_hidden == 1
+        assert "outside the workspace" in request.description.lower(), (
+            "the user was asked to approve a write outside their workspace with "
+            f"no indication of it: {request.description}"
+        )
+
+    def test_shown_and_hidden_out_of_root_paths_are_both_reported(self, tmp_path):
+        from agent.transports.claude_acp_event_projector import (
+            _MAX_LOCATIONS,
+            project_permission_request,
+        )
+
+        locations = (
+            [{"path": "/etc/shadow"}]
+            + [{"path": str(tmp_path / f"f{i}.py")} for i in range(_MAX_LOCATIONS - 1)]
+            + [{"path": "/etc/passwd"}, {"path": "/etc/hosts"}]
+        )
+        request = project_permission_request(
+            {"toolCall": {
+                "_meta": {"claudeCode": {"toolName": "Edit"}},
+                "title": "Edit many",
+                "locations": locations,
+            }},
+            roots=[str(tmp_path)],
+        )
+
+        assert request.outside_roots == ("/etc/shadow",)
+        assert request.outside_roots_hidden == 2
+        description = request.description.lower()
+        assert "/etc/shadow" in description
+        assert "2 more outside the workspace" in description, (
+            f"the overflow count must be stated: {request.description}"
+        )
+
 
 class TestContinuityPreserved:
     """Roots are session state: they must survive — and be re-sent on — rebind."""

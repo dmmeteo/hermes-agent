@@ -64,6 +64,18 @@ supplies the real one. Cost: skin `tool_emojis` lookups miss for these names and
 fall back to the default glyph. Benefit: the transcript and the bubble never
 claim `read_file` ran when Claude Code's `Read` did.
 
+**Corrected 2026-08-10** (independent review H2): that reading is right for the
+*display* path — `sessionUpdate: "tool_call"` always carries
+`claudeCodeMetaFromToolUse` (`dist/acp-agent.js:5773-5781`). It was NOT true for
+the **permission** path: adapter 0.66.0 emits `_meta` on a
+`session/request_permission` only when the tool call has a parent
+(`...(parentToolUseId ? { _meta: ... } : {})` at both `requestPermissionFromClient`
+sites, `:3768-3772` and `:3843-3847`), so a top-level Bash/Write arrived with no
+declared name and the prompt named the ACP *kind* ("execute", "edit"). The fixes
+pass closes it by correlating the request's `toolCallId` with the `tool_call` the
+adapter emits first (`ensureToolCallEmitted`) — see the
+[fixes report](2026-08-10-claude-code-acp-packet3-fixes-report.md).
+
 **Token counts come from the prompt reply; `usage_update` carries occupancy.**
 ACP reports usage twice, and the two are not interchangeable:
 

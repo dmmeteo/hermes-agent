@@ -9,8 +9,22 @@ Packet 3 **slices 3A (event projection), 3B (permission bridging) and 3C
 [`2026-08-10-claude-code-acp-packet3a-report.md`](2026-08-10-claude-code-acp-packet3a-report.md),
 [`2026-08-10-claude-code-acp-packet3b-report.md`](2026-08-10-claude-code-acp-packet3b-report.md)
 and [`2026-08-10-claude-code-acp-packet3c-report.md`](2026-08-10-claude-code-acp-packet3c-report.md).
-Transcript-level tool rows for curator/memory (3A's R2) remain the one deferred
-Packet 3 item.
+Packet 3 was reviewed independently
+([review](2026-08-10-claude-code-acp-packet3-review.md)) and its four required
+fixes plus two recommendations landed in a follow-up pass
+([fixes report](2026-08-10-claude-code-acp-packet3-fixes-report.md)).
+
+Transcript-level tool rows (3A's R2) remain the one deferred Packet 3 item, and
+"deferred" has a concrete cost worth stating rather than closing by silence:
+`agent/claude_code_runtime.py` never splices `(assistant tool_calls, tool)` pairs
+into `messages` the way `agent/codex_runtime.py` does, so `agent/curator.py`,
+external-memory review, background-review snapshots and `session_search` all see
+a Claude Code turn as text with **no tool activity at all**. Packet 3's scope
+bullet says *display*, so this is not an acceptance failure — it is a parity gap
+with the sibling delegated runtime, scheduled, not closed. Two further items the
+review left open are also not implemented: a Hermes-side post-cancel grace
+deadline (3C R3 / review L1) and any adapter-side pre-approved-tool policy
+(3B R1 / 3C R1 / review M3).
 **Branch:** `feat/claude-code-acp-runtime`
 **Spike report:** [`2026-08-09-claude-code-acp-packet0-spike.md`](2026-08-09-claude-code-acp-packet0-spike.md)
 

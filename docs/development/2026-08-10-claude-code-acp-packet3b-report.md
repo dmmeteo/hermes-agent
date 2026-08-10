@@ -29,7 +29,7 @@ Recovered intact and kept as-is:
 
 | Piece | Where | What it does |
 |---|---|---|
-| Approval entry point | `tools/approval.py::request_delegated_runtime_approval` | Routes a delegated runtime's action into the shared `_run_approval_gate` decision core — same allowlists, timeout, cron policy, and fail-closed rule as a dangerous shell command. Opts into `fail_closed_when_no_human=True`. |
+| Approval entry point | `tools/approval.py::request_delegated_runtime_approval` | Routes a delegated runtime's action into the shared `_run_approval_gate` decision core — same allowlists, timeout, cron policy, and fail-closed rule as a dangerous shell command. Opts into `fail_closed_when_no_human=True`. **Corrected 2026-08-10** (independent review H1): as written in 3B this entry point went *straight* to the gate, so it did NOT match a dangerous shell command on the two checks that fire before the yolo bypass — `detect_hardline_command` and `_match_user_deny_rule`. The fixes pass adds that floor (`_delegated_runtime_floor`); see the [fixes report](2026-08-10-claude-code-acp-packet3-fixes-report.md). |
 | Protocol decision | `agent/claude_acp_session.py::_decide_permission` | Replaces Packet 1's blanket denial. Protocol routing only; no policy. Always answers (an unanswered agent request deadlocks the prompt). |
 | Single-shot allow | `agent/transports/claude_acp.py::allow_permission_response` | Selects only an `allow_once` option, never `allow_always`. |
 | Runtime seam | `agent/claude_code_runtime.py::make_claude_acp_permission_bridge` | Wires the handler into `run_turn`; grains the allowlist on a hash of the request signature. |
@@ -73,11 +73,19 @@ action.** Fixed by splitting display from identity:
 - `project_permission_request` shows the first `_MAX_LOCATIONS` and records the
   remainder in a new `PermissionRequest.omitted_locations` field.
 - `description` reports the overflow as `(+N more)`.
-- **The signature is computed over all declared paths, not the displayed slice.**
-  This is the part that mattered: under the old code, two different bulk edits
-  agreeing on their first eight paths produced an identical signature, so an
+- **The signature is computed over all declared path *entries*, not the displayed
+  slice.** This is the part that mattered: under the old code, two different bulk
+  edits agreeing on their first eight paths produced an identical signature, so an
   `[a]lways` answer to one would silently blanket the other — precisely the
   collision the implementation's own docstrings promise cannot happen.
+
+  **Corrected 2026-08-10** (independent review M1): the original wording here
+  said "all declared paths". Every *entry* did reach the signature, but each entry
+  was its **display** form — scrubbed and truncated to `_MAX_PREVIEW_CHARS` — so
+  two siblings under a 120-char common prefix, or two paths differing only inside
+  a secret-shaped segment, still collided. The fixes pass hashes the raw declared
+  values and keeps the display values for display; see the
+  [fixes report](2026-08-10-claude-code-acp-packet3-fixes-report.md).
 
 ### 3. Coverage for the grant-grain claim (test gap)
 
@@ -200,6 +208,19 @@ Task-brief requirements:
    prompt. Closing this needs adapter-side policy control, which no packet
    currently owns. **This is the one risk I would not ship without stating to
    users.**
+
+   **Evidenced and corrected 2026-08-10** (independent review M3, and the
+   [Packet 3 fixes report](2026-08-10-claude-code-acp-packet3-fixes-report.md)):
+   the adapter creates its query with
+   `settingSources: ["user", "project", "local"]` (`dist/acp-agent.js:4431`), so
+   `~/.claude/settings.json`, `.claude/settings.json` and
+   `.claude/settings.local.json` — `permissions.allow` included — are all loaded,
+   and a tool the CLI's own engine allows never reaches `canUseTool`. 3C's
+   mitigation that negotiated roots still bound those tools holds only for the
+   **file** tools: `additionalDirectories` is a permission-rule input rather than
+   a sandbox, and `toolInfoFromToolUse` emits no `locations` for `Bash`, so a
+   pre-approved `Bash(*)` writes anywhere the Hermes process can. The
+   user-facing statement must say that too.
 2. **Broad suites not run.** Per instruction, only the new tests and directly
    affected approval/ACP suites ran (330 tests across 17 files, all green). `tools/approval.py`
    changed additively, and the projector change is reachable only from the

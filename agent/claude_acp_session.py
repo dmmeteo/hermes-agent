@@ -509,6 +509,12 @@ class ClaudeAcpSession:
                         method,
                         request_params,
                         permission_handler=permission_handler,
+                        # The projector has already seen the `tool_call` this
+                        # permission request refers to (the adapter emits it
+                        # first, and one stdio stream is ordered), so it knows
+                        # the tool's declared name even though the request
+                        # itself carries none for a top-level call.
+                        name_lookup=projector.declared_tool_name,
                     ),
                     on_dispatched=lambda: self._reissue_cancel(turn),
                     timeout=TURN_TIMEOUT_SECONDS,
@@ -571,6 +577,7 @@ class ClaudeAcpSession:
         params: Dict[str, Any],
         *,
         permission_handler: Optional[Callable[[Any], bool]] = None,
+        name_lookup: Optional[Callable[[str], str]] = None,
     ) -> Dict[str, Any]:
         """Answer agent-initiated requests. Only permissions are handled.
 
@@ -581,7 +588,9 @@ class ClaudeAcpSession:
         context-local.
         """
         if method == "session/request_permission":
-            return self._decide_permission(params, permission_handler)
+            return self._decide_permission(
+                params, permission_handler, name_lookup=name_lookup
+            )
         if method.startswith("fs/"):
             return self._refuse_filesystem_request(method, params)
         raise PermissionError(f"client does not handle {method}")
@@ -619,6 +628,8 @@ class ClaudeAcpSession:
         self,
         params: Dict[str, Any],
         permission_handler: Optional[Callable[[Any], bool]],
+        *,
+        name_lookup: Optional[Callable[[str], str]] = None,
     ) -> Dict[str, Any]:
         """Decide one ``session/request_permission``. Default is deny.
 
@@ -637,6 +648,12 @@ class ClaudeAcpSession:
           was in flight when the user pressed stop, and a stop must not be
           answered with a write,
         * the handler raised, or returned anything other than approval.
+
+        ``name_lookup`` maps a ``toolCallId`` to the tool name the adapter
+        declared on the ``tool_call`` it emitted before asking. Adapter 0.66.0
+        puts ``_meta.claudeCode.toolName`` on the permission request only for a
+        sub-agent's (parented) call, so without this the prompt for an ordinary
+        Bash/Write would name the ACP *kind* instead of the tool.
 
         Always answers. An unanswered agent request deadlocks the prompt until
         the turn timeout, which is strictly worse for the user than a denial.
@@ -668,10 +685,21 @@ class ClaudeAcpSession:
             project_permission_request,
         )
 
+        tool_call = params.get("toolCall")
+        call_id = ""
+        if isinstance(tool_call, dict):
+            call_id = str(tool_call.get("toolCallId") or "")
+        hint = ""
+        if name_lookup is not None and call_id:
+            try:
+                hint = name_lookup(call_id) or ""
+            except Exception:
+                logger.debug("declared tool-name lookup raised", exc_info=True)
+
         try:
-            approved = bool(permission_handler(
-                project_permission_request(params, roots=self.workspace_roots)
-            ))
+            approved = bool(permission_handler(project_permission_request(
+                params, roots=self.workspace_roots, tool_name_hint=hint,
+            )))
         except Exception:
             # A broken approval surface must not become an approval.
             logger.warning(

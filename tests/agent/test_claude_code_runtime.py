@@ -196,6 +196,53 @@ class TestDeterministicReaping:
         _assert_reaped(record)
 
 
+class TestSteerIsNotLost:
+    """``steer()`` reports "accepted", so the text must actually be delivered.
+
+    The delegated early return bypasses every drain the chat-completions loop
+    owns (the pre-API drain, the tool-result applier, the turn finalizer), so a
+    steer parked in ``_pending_steer`` would be silently dropped even though the
+    CLI, the gateway and the TUI all told the user it landed. The finalizer's own
+    answer for "a steer with no tool batch left to drain into" is
+    ``result["pending_steer"]``, which those three surfaces already deliver as
+    the next user turn — this runtime owes the same key.
+    """
+
+    def test_a_steer_during_the_turn_comes_back_as_the_next_turn(self, agent):
+        agent.steer("actually, focus on the parser")
+        try:
+            result = agent.run_conversation("hello")
+        finally:
+            agent.close()
+
+        assert result["completed"] is True
+        assert result.get("pending_steer") == "actually, focus on the parser", (
+            "the steer was accepted and then dropped: no surface can deliver it"
+        )
+        assert agent._pending_steer is None, "the steer must be drained once"
+
+    def test_a_turn_with_no_steer_does_not_invent_the_key(self, agent):
+        try:
+            result = agent.run_conversation("hello")
+        finally:
+            agent.close()
+
+        assert "pending_steer" not in result
+
+    def test_a_steer_survives_a_failed_turn(self, tmp_path):
+        """A setup failure must not eat the user's guidance either."""
+        a = _make_agent()
+        a.acp_command = "definitely-not-a-real-adapter-binary"
+        a.acp_args = []
+        a.session_cwd = str(tmp_path)
+        a.steer("use the other library")
+
+        result = a.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result.get("pending_steer") == "use the other library"
+
+
 class TestMissingAdapter:
     def test_missing_adapter_fails_with_an_actionable_message(self, tmp_path):
         a = _make_agent()

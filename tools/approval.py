@@ -3570,12 +3570,71 @@ def request_tool_approval(
     )
 
 
+def _delegated_runtime_floor(
+    runtime: str,
+    action: str,
+    declared_command: str,
+    declared_paths,
+) -> Optional[dict]:
+    """The two checks that fire BEFORE any bypass, for a delegated runtime.
+
+    ``check_dangerous_command`` runs :func:`detect_hardline_command` and
+    :func:`_match_user_deny_rule` ahead of the ``--yolo`` /
+    ``approvals.mode=off`` bypass, and :func:`_user_deny_block_result` promises
+    the user their rule holds "not even with --yolo". A delegated runtime runs
+    its own tool loop, so Hermes never sees the command through
+    ``check_all_command_guards`` — the floor has to be re-applied where the
+    runtime *asks*, or the promise is void for every Bash/Write the adapter
+    performs.
+
+    What is measured, and why the two inputs are treated differently:
+
+    * ``declared_command`` — the runtime's own command text, verbatim (never the
+      scrubbed/truncated display form: a redacted command is not the command).
+      Both checks apply, exactly as for Hermes' own shell tool.
+    * ``declared_paths`` — the files the action names. Only the user's deny
+      globs apply. The hardline blocklist is written against shell syntax and
+      matches on substrings, so a bare path trips it by name alone
+      (``/w/mkfs-notes.md`` → "format filesystem"); an unconditional,
+      un-overridable block on an ordinary edit is a worse failure than the one
+      it would prevent.
+
+    Returns the block result, or None when nothing on the floor matched.
+    """
+    if declared_command.strip():
+        is_hardline, hardline_desc = detect_hardline_command(declared_command)
+        if is_hardline:
+            logger.warning(
+                "Hardline block: %s (%s asked to run '%s': %s)",
+                hardline_desc, runtime, action, declared_command[:200],
+            )
+            # Deliberately without the command: the parser-limit arm of
+            # `_hardline_block_result` saves the payload as a runnable script and
+            # tells the model to `bash` it, which is Hermes-tool advice for an
+            # agent that lives inside the adapter and only ever learns "denied".
+            return _hardline_block_result(hardline_desc)
+
+    for text in (declared_command, *(declared_paths or ())):
+        if not isinstance(text, str) or not text.strip():
+            continue
+        deny_pattern = _match_user_deny_rule(text)
+        if deny_pattern is not None:
+            logger.warning(
+                "User deny rule %r blocked %s action '%s' on: %s",
+                deny_pattern, runtime, action, text[:200],
+            )
+            return _user_deny_block_result(deny_pattern)
+    return None
+
+
 def request_delegated_runtime_approval(
     runtime: str,
     action: str,
     description: str,
     *,
     rule_key: str = "",
+    declared_command: str = "",
+    declared_paths=(),
     approval_callback=None,
 ) -> dict:
     """Escalate an action a *delegated coding runtime* wants to take.
@@ -3598,6 +3657,13 @@ def request_delegated_runtime_approval(
         rule_key: Stable identifier controlling the ``[a]lways`` grain. Callers
             pass a signature of *what is being asked* so answering "always" to
             one action cannot blanket a different one on the same tool.
+        declared_command: The runtime's own command text, verbatim. Measured
+            against the unconditional floor (hardline blocklist + the user's
+            ``approvals.deny`` rules) BEFORE the recoverable approval layer, so
+            those two checks mean the same thing here as they do for Hermes'
+            own shell tool. See :func:`_delegated_runtime_floor`.
+        declared_paths: The raw paths the action names, measured against the
+            user's deny rules only (see :func:`_delegated_runtime_floor`).
         approval_callback: Optional CLI callback (same contract as elsewhere).
 
     Returns:
@@ -3607,6 +3673,12 @@ def request_delegated_runtime_approval(
     as everywhere else): a delegated runtime must never get a write through
     simply because nobody was there to refuse it.
     """
+    floor_block = _delegated_runtime_floor(
+        runtime, action, declared_command, declared_paths
+    )
+    if floor_block is not None:
+        return floor_block
+
     label = f"{runtime}: {action}"
     if rule_key:
         key_suffix = rule_key

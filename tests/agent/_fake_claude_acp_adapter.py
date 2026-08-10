@@ -49,6 +49,11 @@ Env vars:
                       hand the adapter a standing grant
                       (``permission`` asks once per prompt, so a second turn on
                       the same session asks a second time)
+    ``permission-subagent``
+                      like ``permission``, but the tool call is attributed to a
+                      parent (a sub-agent's tool use) — the ONLY shape in which
+                      adapter 0.66.0 puts ``_meta.claudeCode.toolName`` on the
+                      permission request itself
     ``permission-after-partial``
                       stream text whose last character could open a ``<think>``
                       tag (so the streaming scrubber holds it back), THEN ask
@@ -108,10 +113,17 @@ _session_counter = 0
 
 # Anthropic credential vars must NOT reach this child: the provider advertises
 # subscription auth. The runtime strips them; the tests assert on this record.
+# ``FAKE_ACP_WATCH_ENV`` adds further names (comma-separated) so a test can
+# assert about an unrelated provider/tool secret without this list growing one
+# entry per provider.
 _WATCHED_ENV_VARS = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
+) + tuple(
+    name.strip()
+    for name in os.getenv("FAKE_ACP_WATCH_ENV", "").split(",")
+    if name.strip()
 )
 
 _record: dict = {
@@ -421,17 +433,43 @@ def _handle_permission(session_id: str, msg: dict) -> None:
     # Flush BEFORE blocking on the answer: a test that waits for "the adapter
     # has asked" must be able to see it while the request is still open.
     _flush_record()
+    # Adapter 0.66.0 fidelity, part 1: `ensureToolCallEmitted` sends the
+    # referenced `tool_call` BEFORE asking, so the client already has the call
+    # a permission request points at (issue #851). That update carries
+    # `_meta.claudeCode.toolName` unconditionally — unlike the request itself.
+    call = {
+        "toolCallId": "tc-write",
+        # Credential-shaped noise in the human-facing fields: the approval
+        # prompt is user-visible text and must be scrubbed like any other.
+        "title": f"Write permission-probe.txt ({TOOL_OUTPUT_SECRET})",
+        "kind": "edit",
+        "rawInput": {"file_path": target, "token": TOOL_INPUT_SECRET},
+        "locations": [{"path": target}, {"path": OUTSIDE_WORKSPACE_LOCATION}],
+    }
+    parented = _MODE == "permission-subagent"
+    _update(session_id, {
+        "sessionUpdate": "tool_call",
+        "status": "pending",
+        **call,
+        "_meta": {
+            "claudeCode": {
+                "toolName": "Write",
+                **({"parentToolUseId": "tc-task"} if parented else {}),
+            }
+        },
+    })
+    # Adapter 0.66.0 fidelity, part 2: on the *permission request* the
+    # `claudeCode` meta block is emitted ONLY for a parented (sub-agent) tool
+    # call — `...(parentToolUseId ? { _meta: ... } : {})` at both
+    # `requestPermissionFromClient` sites. A top-level Bash/Write therefore
+    # arrives with no declared tool name at all.
     answer = _ask_client(9100 + _permission_request_counter, "session/request_permission", {
         "sessionId": session_id,
         "toolCall": {
-            "toolCallId": "tc-write",
-            # Credential-shaped noise in the human-facing fields: the approval
-            # prompt is user-visible text and must be scrubbed like any other.
-            "title": f"Write permission-probe.txt ({TOOL_OUTPUT_SECRET})",
-            "kind": "edit",
-            "rawInput": {"file_path": target, "token": TOOL_INPUT_SECRET},
-            "locations": [{"path": target}, {"path": OUTSIDE_WORKSPACE_LOCATION}],
-            "_meta": {"claudeCode": {"toolName": "Write"}},
+            **call,
+            **({"_meta": {"claudeCode": {
+                "toolName": "Write", "parentToolUseId": "tc-task",
+            }}} if parented else {}),
         },
         "options": options,
     })
@@ -554,7 +592,7 @@ def _handle_prompt(msg: dict) -> None:
         _send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "refusal"}})
         return
 
-    if _MODE in ("permission", "permission-no-once"):
+    if _MODE in ("permission", "permission-no-once", "permission-subagent"):
         _handle_permission(session_id, msg)
         return
 
