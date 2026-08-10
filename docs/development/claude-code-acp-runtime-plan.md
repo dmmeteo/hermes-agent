@@ -4,11 +4,13 @@
 remediation pass against an independent review (findings F1–F9, F13, F15).
 Packet 2 complete — see
 [`2026-08-10-claude-code-acp-packet2-report.md`](2026-08-10-claude-code-acp-packet2-report.md).
-Packet 3 **slices 3A (event projection) and 3B (permission bridging) complete** —
-see [`2026-08-10-claude-code-acp-packet3a-report.md`](2026-08-10-claude-code-acp-packet3a-report.md)
-and [`2026-08-10-claude-code-acp-packet3b-report.md`](2026-08-10-claude-code-acp-packet3b-report.md);
-cancellation settling and workspace-root negotiation (slice 3C) are the
-remaining Packet 3 work and are not started.
+Packet 3 **slices 3A (event projection), 3B (permission bridging) and 3C
+(cancellation settling + workspace containment) complete** — see
+[`2026-08-10-claude-code-acp-packet3a-report.md`](2026-08-10-claude-code-acp-packet3a-report.md),
+[`2026-08-10-claude-code-acp-packet3b-report.md`](2026-08-10-claude-code-acp-packet3b-report.md)
+and [`2026-08-10-claude-code-acp-packet3c-report.md`](2026-08-10-claude-code-acp-packet3c-report.md).
+Transcript-level tool rows for curator/memory (3A's R2) remain the one deferred
+Packet 3 item.
 **Branch:** `feat/claude-code-acp-runtime`
 **Spike report:** [`2026-08-09-claude-code-acp-packet0-spike.md`](2026-08-09-claude-code-acp-packet0-spike.md)
 
@@ -66,6 +68,7 @@ precedent for this shape.
 | api_mode allow-list | `agent/agent_init.py:637` | Add `"claude_code_acp"` |
 | Runtime module | new `agent/claude_code_runtime.py` | Analogue of `agent/codex_runtime.py` |
 | Session adapter | new `agent/claude_acp_session.py` | Analogue of `codex_app_server_session.py` (**exists, Packet 2**) |
+| Workspace roots | new `agent/claude_acp_workspace.py` | **Exists (Packet 3C)** — resolves `cwd` + explicitly-allowed `additionalDirectories` from `model.claude_code_acp.additional_directories`, and owns the root check every agent-initiated path is measured against |
 | Session binding + turn lease | new `agent/claude_acp_binding.py` | ACP session id + lease on the Hermes `sessions.model_config` row (**exists, Packet 2**) |
 | Event projection | new `agent/transports/claude_acp_event_projector.py` | Analogue of `codex_event_projector.py` (**exists, Packet 3A**), consumed through the `event_sink` seam on `ClaudeAcpSession.run_turn` and the bridge in `claude_code_runtime.make_claude_acp_event_bridge` |
 | Wire client | `agent/transports/claude_acp.py` | **Exists (Packet 0)** |
@@ -246,8 +249,8 @@ transcript state into an ACP-side store — that breaks the ownership split.
 **Goal.** Tool activity, approvals, and cancellation behave like native Hermes
 on every surface (CLI, Discord, Telegram).
 
-**Progress.** Slices **3A (event projection)** and **3B (permission bridging)**
-are complete — see the
+**Progress.** Slices **3A (event projection)**, **3B (permission bridging)** and
+**3C (cancellation settling + workspace containment)** are complete — see the
 [Packet 3A report](2026-08-10-claude-code-acp-packet3a-report.md) and the
 [Packet 3B report](2026-08-10-claude-code-acp-packet3b-report.md). 3A delivered
 the first scope bullet below (tool activity, streaming, usage) with credential
@@ -257,8 +260,12 @@ carries context occupancy (never summed), and Hermes' context compressor is
 deliberately not driven on this runtime (closes Packet 2 R5). 3B replaced the
 blanket denial with Hermes' own approval gate on every surface, keeping deny as
 the default on every path that cannot produce a human answer, and never handing
-the adapter a standing grant. Still open (slice **3C**): cancellation settling,
-workspace-root negotiation, and transcript-level tool rows for curator/memory.
+the adapter a standing grant. 3C settled cancellation (one delivery, lease
+released, pending approvals fail closed, nothing left running) and made
+workspace containment a negotiated fact — `cwd` plus only the directories named
+in `model.claude_code_acp.additional_directories`, capability-gated, re-sent on
+rebind, and the yardstick for every agent-initiated filesystem request. Still
+open: transcript-level tool rows for curator/memory (3A's R2).
 
 **Scope.**
 - Project `tool_call` / `tool_call_update` into Hermes' tool-activity display;
@@ -271,9 +278,10 @@ workspace-root negotiation, and transcript-level tool rows for curator/memory.
   → `default` negotiation already landed in Packet 1 and must stay.
   ✅ **slice 3B**
 - Interrupt → `session/cancel`; the turn must settle as `cancelled` and
-  release its lease.
+  release its lease. ✅ **slice 3C**
 - Workspace containment via session `cwd` + `additionalDirectories`, **not**
   via `fs/*` interception (the adapter uses its own tools — spike §R4).
+  ✅ **slice 3C**
 
 **Non-scope.** New core model tools. New user-facing commands.
 

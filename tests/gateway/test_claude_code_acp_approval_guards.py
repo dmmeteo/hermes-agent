@@ -189,6 +189,7 @@ class _BlockedTurn:
         self.notifications = []
         self.result = {}
         self.error = None
+        self.agent = None
         self._thread = None
 
     def notify(self, approval_data: dict) -> None:
@@ -223,6 +224,10 @@ class _BlockedTurn:
             agent.acp_command = sys.executable
             agent.acp_args = [_FAKE_ADAPTER]
             agent.session_cwd = str(self.tmp_path)
+            # Published before the turn so a test can stop it from outside —
+            # `AIAgent.interrupt()` flags this thread, which is where the
+            # approval wait is parked.
+            self.agent = agent
             self.result = agent.run_conversation("please write a file")
         except Exception as exc:  # surfaced by the test, never swallowed
             self.error = exc
@@ -511,3 +516,46 @@ class TestTheUserSeesTheRequest:
         }
         assert turn.wrote_file is False
         assert result["completed"] is True
+
+
+# --------------------------------------------------------------------------- #
+# slice 3C — a stop while the approval is pending
+# --------------------------------------------------------------------------- #
+
+
+class TestInterruptDuringApproval:
+    """3B risk 6, closed by slice 3C's cancellation work.
+
+    On a messaging surface the approval wait is a poll loop with a 300 s
+    ceiling, and the delegated turn is parked inside it. If `/stop` did not
+    reach that loop, the session would stay wedged for five minutes after the
+    user asked it to stop — and the request would then have to settle on
+    something other than the user's intent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_stop_denies_the_pending_approval_and_unwedges_the_turn(
+        self, blocked_turn
+    ):
+        runner = _make_runner()
+        session_key = runner._session_key_for_source(_make_source())
+        turn = blocked_turn(session_key)
+
+        assert turn.agent is not None, "the blocked turn never published its agent"
+        started = time.time()
+        turn.agent.interrupt("stop")
+        result = turn.join(timeout=120)
+        elapsed = time.time() - started
+
+        assert elapsed < 60, (
+            f"the stopped approval held the session for {elapsed:.0f}s — the "
+            "wait must resolve on the interrupt, not on the approval timeout"
+        )
+        assert turn.record_data["permission_outcome"] == {
+            "outcome": "selected", "optionId": "deny",
+        }, "a stopped approval settled as anything other than a denial"
+        assert turn.wrote_file is False
+        assert result["interrupted"] is True
+        assert result["final_response"].strip(), (
+            "a stopped turn must still leave an assistant row"
+        )

@@ -165,9 +165,13 @@ class ClaudeAcpSession:
         cwd: str,
         store: Optional[BindingStore] = None,
         hermes_session_id: str = "",
+        additional_directories: Optional[List[str]] = None,
     ) -> None:
         self.argv = list(argv)
         self.cwd = cwd
+        #: Extra roots the user explicitly allowed, already validated by
+        #: ``agent/claude_acp_workspace.py``. Empty means "the workspace only".
+        self.additional_directories = list(additional_directories or [])
         self.key = hermes_session_id or f"anon-{id(self):x}"
         self._store = store if store is not None else BindingStore()
         self._client: Optional[Any] = None
@@ -202,8 +206,34 @@ class ClaudeAcpSession:
         client = self._client
         return client is not None and client.is_alive()
 
-    def matches(self, argv: List[str], cwd: str) -> bool:
-        return self.argv == list(argv) and self.cwd == cwd
+    @property
+    def workspace_roots(self) -> List[str]:
+        """Every directory this session negotiated: the cwd, then the extras.
+
+        This is the yardstick for anything the agent asks the client to touch.
+        It is deliberately the same list that went out on ``session/new``, so a
+        request cannot be checked against a wider scope than the one the session
+        was created with.
+        """
+        return [self.cwd] + list(self.additional_directories)
+
+    def matches(
+        self,
+        argv: List[str],
+        cwd: str,
+        additional_directories: Optional[List[str]] = None,
+    ) -> bool:
+        """Whether a live session is still the right one for these settings.
+
+        The roots are part of the answer: they are negotiated on the wire at
+        session creation, so a changed root list means the running adapter is
+        scoped to something other than what the caller now wants.
+        """
+        return (
+            self.argv == list(argv)
+            and self.cwd == cwd
+            and self.additional_directories == list(additional_directories or [])
+        )
 
     # ---------- cancellation ----------
 
@@ -319,10 +349,16 @@ class ClaudeAcpSession:
                 "Discarding Claude Code ACP binding for session %s: workspace "
                 "changed (%s -> %s)", self.key, binding.get("cwd"), self.cwd,
             )
+        # Containment is negotiated, not intercepted (Packet 0, R4): the adapter
+        # uses its own tools, so the only place Hermes can bound the workspace
+        # is the session-creation call. Capability-gated — an agent that never
+        # advertised the field gets the cwd alone, which is narrower.
+        roots = self._negotiable_roots(client)
+
         reseeded = bool(prior) and not bound
         if bound and client.supports_load_session:
             try:
-                client.session_load(bound)
+                client.session_load(bound, additional_directories=roots)
                 # The agent replays its history as notifications before
                 # answering. Hermes owns the transcript, so none of it may be
                 # projected — and none of it may still be queued when the next
@@ -348,7 +384,7 @@ class ClaudeAcpSession:
             reseeded = True
 
         if not self._acp_session_id:
-            self._acp_session_id = client.session_new()
+            self._acp_session_id = client.session_new(additional_directories=roots)
 
         # SECURITY: the adapter starts in `auto`, where a classifier approves
         # writes and shell commands without ever asking Hermes. Move it to
@@ -358,6 +394,19 @@ class ClaudeAcpSession:
         self._store.bind(self._acp_session_id, self.cwd)
         turn.session_id = self._acp_session_id
         return reseeded
+
+    def _negotiable_roots(self, client: Any) -> List[str]:
+        """The extra roots this agent will actually accept on the wire."""
+        if not self.additional_directories:
+            return []
+        if not client.supports_additional_directories:
+            logger.warning(
+                "The Claude Code adapter does not support additional workspace "
+                "directories; session %s runs with %s only",
+                self.key, self.cwd,
+            )
+            return []
+        return list(self.additional_directories)
 
     # ---------- the turn ----------
 
@@ -533,7 +582,38 @@ class ClaudeAcpSession:
         """
         if method == "session/request_permission":
             return self._decide_permission(params, permission_handler)
+        if method.startswith("fs/"):
+            return self._refuse_filesystem_request(method, params)
         raise PermissionError(f"client does not handle {method}")
+
+    def _refuse_filesystem_request(
+        self, method: str, params: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Refuse an ``fs/*`` request, out-of-root ones by name.
+
+        Hermes advertises ``fs.readTextFile`` / ``fs.writeTextFile`` as false at
+        ``initialize``, so any ``fs/*`` request is unsolicited whatever it names
+        — serving one would hand the agent a capability it was told does not
+        exist, on a thread that is meanwhile driving a turn.
+
+        The containment check still runs first, and deliberately so. It is the
+        one place a path the agent chose is measured against the roots the
+        session negotiated, so the refusal says *why* — and if this client ever
+        does advertise a filesystem capability, the check is already the gate
+        rather than something a later change has to remember to add.
+        """
+        from agent.claude_acp_workspace import resolve_within_roots
+
+        path = params.get("path")
+        if isinstance(path, str) and path.strip():
+            # Raises PermissionError naming the workspace, which the wire layer
+            # turns into a JSON-RPC error reply — never silence, which would
+            # deadlock the turn.
+            resolve_within_roots(path, self.workspace_roots)
+        raise PermissionError(
+            f"client does not handle {method}: Hermes advertises no filesystem "
+            "capability for this session"
+        )
 
     def _decide_permission(
         self,
@@ -553,6 +633,9 @@ class ClaudeAcpSession:
           hand the adapter a standing grant Hermes could no longer see,
         * the turn is already cancelled: a user who pressed stop is not asked to
           approve more work,
+        * the turn was cancelled *while* the handler was deciding — the answer
+          was in flight when the user pressed stop, and a stop must not be
+          answered with a write,
         * the handler raised, or returned anything other than approval.
 
         Always answers. An unanswered agent request deadlocks the prompt until
@@ -586,7 +669,9 @@ class ClaudeAcpSession:
         )
 
         try:
-            approved = bool(permission_handler(project_permission_request(params)))
+            approved = bool(permission_handler(
+                project_permission_request(params, roots=self.workspace_roots)
+            ))
         except Exception:
             # A broken approval surface must not become an approval.
             logger.warning(
@@ -597,6 +682,12 @@ class ClaudeAcpSession:
 
         if not approved:
             return _deny("the user did not approve it")
+        if self.cancel_requested:
+            # The stop landed while the human was deciding. The decision runs
+            # synchronously on the turn thread, so this is where such a stop
+            # necessarily arrives — and settling it as anything but a denial
+            # would let `/stop` be answered with the write the user stopped.
+            return _deny("the turn was cancelled while the approval was pending")
         self.granted_permissions += 1
         logger.info("Claude Code ACP: permission granted for one action")
         return allow

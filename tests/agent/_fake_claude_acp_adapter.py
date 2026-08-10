@@ -49,7 +49,25 @@ Env vars:
                       hand the adapter a standing grant
                       (``permission`` asks once per prompt, so a second turn on
                       the same session asks a second time)
+    ``permission-after-partial``
+                      stream text whose last character could open a ``<think>``
+                      tag (so the streaming scrubber holds it back), THEN ask
+                      for permission — the ordering that decides whether the
+                      held tail renders before or after the approval prompt
+    ``fs-requests``   ask the client for ``fs/write_text_file`` inside the
+                      workspace and ``fs/read_text_file`` outside it, record
+                      both replies, then finish normally. Models an agent that
+                      calls back into the client's filesystem regardless of the
+                      capabilities the client advertised.
+    ``no-additional-dirs``
+                      like ``memory``, but advertise NO
+                      ``sessionCapabilities.additionalDirectories`` — an older
+                      adapter that cannot widen a session's roots
     ``grandchild``    spawn a long-lived grandchild, then behave like ``normal``
+    ``cancel-grandchild``
+                      spawn a long-lived grandchild, then block until cancelled
+                      and answer ``cancelled`` — the shape a stopped turn leaves
+                      behind if teardown only reaps the direct child
     ``cancel-empty``  block until cancelled and answer ``cancelled`` with NO text
     ``auth-required`` report an auth method from ``initialize``, then fail
                       ``session/new`` the way an unauthenticated adapter does
@@ -116,6 +134,20 @@ _record: dict = {
     "session_new_calls": [],
     "session_load_calls": [],
     "prompts": [],
+    # Packet 3C evidence. The workspace roots are negotiated in the params of
+    # session/new and session/load, so the full params of both are recorded —
+    # asserting on `cwd` + `additionalDirectories` is the whole containment
+    # contract on this side of the wire.
+    "session_new_params": [],
+    "session_load_params": [],
+    # What the client advertised it can do. `fs` / `terminal` here decide
+    # whether the agent is entitled to call back into the client at all.
+    "client_capabilities": None,
+    # Every session/cancel this adapter received, in order.
+    "cancel_calls": [],
+    # Replies to the agent-initiated requests this adapter sent, so a test can
+    # assert HOW the client refused rather than only that the turn survived.
+    "client_request_replies": [],
 }
 _record_lock = threading.Lock()
 
@@ -312,6 +344,40 @@ def _handle_typed_events(session_id: str, msg: dict) -> None:
            "result": {"stopReason": "end_turn", "usage": dict(TURN_USAGE)}})
 
 
+#: Paths the ``fs-requests`` mode asks the client to touch. The second one sits
+#: outside any workspace the client could have negotiated, so a client that
+#: served it would have escaped its own containment.
+FS_REQUEST_INSIDE = "fs-request-inside-workspace.txt"
+FS_REQUEST_OUTSIDE = "/hermes-acp-fs-request-outside-root-should-not-exist.txt"
+
+
+def _handle_fs_requests(session_id: str, msg: dict) -> None:
+    """Call back into the client's filesystem, inside and outside the workspace.
+
+    Both are answered by the client one way or another — an unanswered agent
+    request deadlocks the turn — so the turn finishing at all is part of what
+    this mode proves.
+    """
+    inside = os.path.join(os.getcwd(), FS_REQUEST_INSIDE)
+    for request_id, method, params in (
+        (9200, "fs/write_text_file",
+         {"sessionId": session_id, "path": inside, "content": "written by the agent"}),
+        (9201, "fs/read_text_file",
+         {"sessionId": session_id, "path": FS_REQUEST_OUTSIDE}),
+    ):
+        reply = _ask_client(request_id, method, params)
+        with _record_lock:
+            _record["client_request_replies"].append({
+                "method": method,
+                "path": params.get("path"),
+                "error": reply.get("error"),
+                "result": reply.get("result"),
+            })
+        _flush_record()
+    _text(session_id, "Filesystem round-trip done.")
+    _send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}})
+
+
 def _spawn_grandchild() -> None:
     """A descendant that outlives the adapter unless the whole tree is killed."""
     child = subprocess.Popen(
@@ -408,6 +474,7 @@ def _handle_load(msg: dict) -> None:
     session_id = params.get("sessionId") or ""
     with _record_lock:
         _record["session_load_calls"].append(session_id)
+        _record["session_load_params"].append(params)
     _flush_record()
 
     if _MODE == "load-fails":
@@ -452,7 +519,10 @@ def _handle_prompt(msg: dict) -> None:
         while True:
             time.sleep(0.2)
 
-    if _MODE in ("memory", "no-load", "load-fails", "load-replays-late", "memory-gated"):
+    if _MODE in (
+        "memory", "no-load", "load-fails", "load-replays-late", "memory-gated",
+        "no-additional-dirs",
+    ):
         if _MODE == "memory-gated":
             # Hold the turn open until the test opens the gate, so the caller
             # can observe in-flight state (the turn lease) from another thread.
@@ -486,6 +556,27 @@ def _handle_prompt(msg: dict) -> None:
 
     if _MODE in ("permission", "permission-no-once"):
         _handle_permission(session_id, msg)
+        return
+
+    if _MODE == "permission-after-partial":
+        # The scrubber holds a trailing '<' until something resolves it, so the
+        # approval prompt is drawn while text the user has not seen is still in
+        # flight. Whether that tail arrives before or after the prompt is the
+        # ordering under test.
+        _text(session_id, "before the prompt <")
+        _handle_permission(session_id, msg)
+        return
+
+    if _MODE == "fs-requests":
+        _handle_fs_requests(session_id, msg)
+        return
+
+    if _MODE == "cancel-grandchild":
+        _spawn_grandchild()
+        _text(session_id, "working ")
+        while not _cancelled.wait(timeout=0.05):
+            pass
+        _send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "cancelled"}})
         return
 
     if _MODE == "slow":
@@ -564,6 +655,11 @@ def main() -> None:
             continue
 
         if method == "session/cancel":
+            with _record_lock:
+                _record["cancel_calls"].append(
+                    (msg.get("params") or {}).get("sessionId")
+                )
+            _flush_record()
             if _MODE != "ignore-cancel":
                 _cancelled.set()
             continue
@@ -574,9 +670,23 @@ def main() -> None:
                 [{"id": "claude-login", "name": "Log in with Claude"}]
                 if _MODE == "auth-required" else []
             )
+            # Mirrors the real adapter: widening a session's filesystem scope
+            # is a session capability the client must be able to gate on.
+            session_capabilities = (
+                {} if _MODE == "no-additional-dirs"
+                else {"additionalDirectories": {}}
+            )
+            with _record_lock:
+                _record["client_capabilities"] = (
+                    (msg.get("params") or {}).get("clientCapabilities")
+                )
+            _flush_record()
             _send({"jsonrpc": "2.0", "id": msg["id"], "result": {
                 "protocolVersion": 1,
-                "agentCapabilities": {"loadSession": _MODE != "no-load"},
+                "agentCapabilities": {
+                    "loadSession": _MODE != "no-load",
+                    "sessionCapabilities": session_capabilities,
+                },
                 "authMethods": auth_methods,
             }})
         elif method == "session/load":
@@ -601,6 +711,8 @@ def main() -> None:
                     "code": -32001, "message": "session could not be created",
                 }})
                 continue
+            with _record_lock:
+                _record["session_new_params"].append(msg.get("params") or {})
             _send({"jsonrpc": "2.0", "id": msg["id"],
                    "result": {"sessionId": _new_session_id()}})
         elif method == "session/set_mode":

@@ -267,7 +267,9 @@ def make_claude_acp_event_bridge(agent) -> Callable[["ProjectedEvent"], None]:
 RUNTIME_LABEL = "Claude Code"
 
 
-def make_claude_acp_permission_bridge() -> Callable[["PermissionRequest"], bool]:
+def make_claude_acp_permission_bridge(
+    before_prompt: Optional[Callable[[], None]] = None,
+) -> Callable[["PermissionRequest"], bool]:
     """Build the ``permission_handler`` that asks the user about one action.
 
     Returns a callable taking a projected ``PermissionRequest`` and returning
@@ -277,9 +279,23 @@ def make_claude_acp_permission_bridge() -> Callable[["PermissionRequest"], bool]
     gateway session key, the interrupt flag. Takes no agent for exactly that
     reason: there is nothing about this decision that Hermes' approval flow does
     not already resolve from the ambient session.
+
+    ``before_prompt`` runs immediately before the user is asked. It exists for
+    one job — releasing text the streaming scrubbers are still holding — and is
+    a bare callable rather than an agent handle so that job cannot grow into
+    "the bridge knows about the agent".
     """
 
     def handler(request: "PermissionRequest") -> bool:
+        if before_prompt is not None:
+            # A prompt drawn while the scrubber holds a trailing partial tag
+            # asks the user about text they have not been shown; the tail then
+            # lands after their answer, glued to whatever came next.
+            try:
+                before_prompt()
+            except Exception:
+                logger.debug("pre-approval stream flush raised", exc_info=True)
+
         from tools.approval import request_delegated_runtime_approval
 
         decision = request_delegated_runtime_approval(
@@ -490,16 +506,23 @@ def _queue_token_counts(agent, canonical: Any, cost_result: Any) -> None:
         )
 
 
-def _get_or_create_session(agent, argv: list[str], cwd: str) -> ClaudeAcpSession:
+def _get_or_create_session(
+    agent, argv: list[str], cwd: str, additional_directories: list[str]
+) -> ClaudeAcpSession:
     """The one live ACP session for this Hermes conversation.
 
-    Recreated only when the adapter argv or the workspace changed — either
-    means the existing adapter is no longer the right process to be talking
-    to, and leaving it running would break the one-adapter-per-session
-    invariant.
+    Recreated only when the adapter argv, the workspace, or the negotiated
+    workspace roots changed — each means the existing adapter is no longer the
+    right process to be talking to (the roots go out on ``session/new``, so a
+    live adapter cannot be re-scoped in place), and leaving it running would
+    break the one-adapter-per-session invariant.
     """
     session = getattr(agent, "_claude_acp_session", None)
-    if session is not None and not session.closed and session.matches(argv, cwd):
+    if (
+        session is not None
+        and not session.closed
+        and session.matches(argv, cwd, additional_directories)
+    ):
         return session
     if session is not None:
         try:
@@ -509,6 +532,7 @@ def _get_or_create_session(agent, argv: list[str], cwd: str) -> ClaudeAcpSession
     session = ClaudeAcpSession(
         argv=argv,
         cwd=cwd,
+        additional_directories=additional_directories,
         store=BindingStore.for_agent(agent),
         # A persistence-isolated fork shares the parent's session_id, so
         # keying the registry on it would retire the user's live adapter out
@@ -548,7 +572,14 @@ def run_claude_code_acp_turn(
         logger.warning("Claude Code ACP adapter unavailable: %s", exc)
         return _failure_result(agent, messages, str(exc))
 
-    session = _get_or_create_session(agent, argv, cwd)
+    # Workspace containment is negotiated at session creation, never inferred:
+    # the cwd, plus only the directories the user explicitly allowed in
+    # config.yaml. See agent/claude_acp_workspace.py.
+    from agent.claude_acp_workspace import resolve_additional_directories
+
+    session = _get_or_create_session(
+        agent, argv, cwd, resolve_additional_directories(cwd)
+    )
 
     try:
         outcome = session.run_turn(
@@ -565,7 +596,9 @@ def run_claude_code_acp_turn(
             # Replaces Packet 1's blanket denial. Absent this handler the
             # session still denies every request, so the fail-closed default
             # survives any future caller that forgets to pass it.
-            permission_handler=make_claude_acp_permission_bridge(),
+            permission_handler=make_claude_acp_permission_bridge(
+                before_prompt=lambda: _flush_stream_surface(agent),
+            ),
         )
     except TurnLeaseConflict as exc:
         # Refuse rather than spawning a second adapter against a session

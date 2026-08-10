@@ -182,13 +182,15 @@ def _declared_tool_name(payload: Dict[str, Any]) -> str:
     return ""
 
 
-def _locations(payload: Dict[str, Any]) -> List[str]:
-    """Every scrubbed ``ToolCallLocation`` path declared by a tool call.
+def _location_pairs(payload: Dict[str, Any]) -> List[tuple]:
+    """``(declared path, display path)`` for every location on a tool call.
 
-    Each path is bounded by the *display* budget, not the argument budget: these
-    become approval-prompt text, and on a messaging platform that text leaves
-    the machine, so a path is bounded exactly like every other human-facing
-    field in this module.
+    Two views of the same list, produced together so they stay index-aligned.
+    The display path is scrubbed and bounded by the *display* budget, not the
+    argument budget: it becomes approval-prompt text, and on a messaging
+    platform that text leaves the machine. The declared path is kept verbatim
+    because that is what a workspace-root check has to measure — a truncated or
+    redacted path resolves to something the agent never asked about.
 
     The list itself is deliberately NOT truncated here. Identity (the approval
     signature) has to see every path a tool declared — two asks that agree on
@@ -198,15 +200,18 @@ def _locations(payload: Dict[str, Any]) -> List[str]:
     raw = payload.get("locations")
     if not isinstance(raw, list):
         return []
-    paths: List[str] = []
+    pairs: List[tuple] = []
     for entry in raw:
         if isinstance(entry, dict):
             path = entry.get("path")
         else:
             path = entry
         if isinstance(path, str) and path.strip():
-            paths.append(_truncate(_scrub_text(path.strip()), _MAX_PREVIEW_CHARS))
-    return paths
+            declared = path.strip()
+            pairs.append(
+                (declared, _truncate(_scrub_text(declared), _MAX_PREVIEW_CHARS))
+            )
+    return pairs
 
 
 @dataclass
@@ -230,6 +235,11 @@ class PermissionRequest:
     #: Reported rather than dropped: a user approving "affects a.py, b.py" when
     #: 392 more files are in scope has been shown the wrong action.
     omitted_locations: int = 0
+    #: Declared paths that fall outside the session's negotiated workspace roots
+    #: (display form, and only the ones shown). Empty when no roots were
+    #: supplied: with nothing to compare against there is no basis for the
+    #: claim, and labelling everything "outside" trains the user to ignore it.
+    outside_roots: tuple = ()
     #: Stable-per-request identity for Hermes' allowlist grain: two requests that
     #: describe the same action share it, so ``[a]lways`` cannot blanket a
     #: different action on the same tool.
@@ -250,16 +260,30 @@ class PermissionRequest:
             parts.append(affects)
         elif self.omitted_locations:
             parts.append(f"affects {self.omitted_locations} paths")
+        if self.outside_roots:
+            # The workspace is what the session negotiated; a path outside it is
+            # the difference between "edit my project" and "edit my home
+            # directory", and the user cannot weigh that from the path alone.
+            parts.append(
+                "outside the workspace: " + ", ".join(self.outside_roots)
+            )
         return "; ".join(parts) or f"{self.tool_name} requested permission"
 
 
-def project_permission_request(params: Dict[str, Any]) -> PermissionRequest:
+def project_permission_request(
+    params: Dict[str, Any], roots: Optional[List[str]] = None
+) -> PermissionRequest:
     """Project ``session/request_permission`` params into a display record.
 
-    Pure: no wire, no callbacks, no filesystem. Every field is
-    credential-scrubbed and bounded before truncation, exactly as for a
-    projected update — an approval prompt is user-visible text, and on a
+    Every field is credential-scrubbed and bounded before truncation, exactly as
+    for a projected update — an approval prompt is user-visible text, and on a
     messaging platform it leaves the machine.
+
+    ``roots`` are the session's negotiated workspace directories. When supplied,
+    declared paths are classified against them so the prompt can say which ones
+    fall outside. Classification only: nothing here opens, reads, or creates a
+    path, and a path outside the roots is still shown to the user rather than
+    silently dropped.
     """
     tool_call = params.get("toolCall")
     if not isinstance(tool_call, dict):
@@ -278,12 +302,21 @@ def project_permission_request(params: Dict[str, Any]) -> PermissionRequest:
     )
     name = _declared_tool_name(tool_call) or kind or "tool"
     args = _as_args(tool_call.get("rawInput"))
-    declared = _locations(tool_call)
+    pairs = _location_pairs(tool_call)
+    declared = [display for _raw, display in pairs]
     # Display is bounded; identity is not. A tool touching 400 files must not
     # turn the prompt into a wall of paths, but the paths it does not show still
     # have to reach the signature — otherwise two different mass edits sharing
     # their first eight paths would share one remembered grant.
     shown = declared[:_MAX_LOCATIONS]
+    outside: tuple = ()
+    if roots:
+        from agent.claude_acp_workspace import is_within_roots
+
+        outside = tuple(
+            display for raw, display in pairs[:_MAX_LOCATIONS]
+            if not is_within_roots(raw, roots)
+        )
     # Identity is derived from WHAT is being asked, never from the adapter's
     # per-call ``toolCallId``: a remembered grant must apply to the same action
     # asked again, and must not apply to a different one.
@@ -302,6 +335,7 @@ def project_permission_request(params: Dict[str, Any]) -> PermissionRequest:
         args=args,
         locations=shown,
         omitted_locations=len(declared) - len(shown),
+        outside_roots=outside,
         signature=signature,
     )
 

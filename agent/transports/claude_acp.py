@@ -92,15 +92,15 @@ def ensure_path_within_roots(path_text: str, roots: list[str]) -> Path:
     Workspace containment for agent-initiated filesystem requests. Uses
     resolved-parent comparison rather than string prefixes, so ``/ws-evil``
     does not pass a ``/ws`` root check and ``..`` traversal cannot escape.
+
+    The rule itself lives in ``agent/claude_acp_workspace.py`` alongside root
+    negotiation — the roots a request is checked against and the roots the
+    session was created with have to be the same notion of "root", and one
+    implementation is how that stays true.
     """
-    resolved = Path(path_text).expanduser().resolve()
-    for root in roots:
-        if not root:
-            continue
-        root_resolved = Path(root).expanduser().resolve()
-        if resolved == root_resolved or root_resolved in resolved.parents:
-            return resolved
-    raise PermissionError(f"path outside the permitted workspace: {path_text}")
+    from agent.claude_acp_workspace import resolve_within_roots
+
+    return resolve_within_roots(path_text, roots)
 
 
 def _terminate_process_tree(proc: Any, pgid: Optional[int] = None) -> None:
@@ -305,6 +305,18 @@ class ClaudeAcpClient:
     def session_capabilities(self) -> dict[str, Any]:
         return self.agent_capabilities.get("sessionCapabilities") or {}
 
+    @property
+    def supports_additional_directories(self) -> bool:
+        """Whether this agent can widen a session beyond its ``cwd``.
+
+        Presence, not truthiness: ACP advertises sub-capabilities as (possibly
+        empty) objects, and ``additionalDirectories: {}`` means supported.
+        Sending the field to an agent that never advertised it is a containment
+        claim we cannot back — some agents ignore an unknown field, others
+        reject the whole request.
+        """
+        return "additionalDirectories" in self.session_capabilities
+
     def stderr_tail(self) -> list[str]:
         """Recent child stderr, for diagnostics. Never logged automatically."""
         with self._stderr_lock:
@@ -505,12 +517,21 @@ class ClaudeAcpClient:
         cwd: Optional[str] = None,
         mcp_servers: Optional[list] = None,
         timeout: float = 60.0,
+        additional_directories: Optional[list[str]] = None,
     ) -> str:
-        result = self.request(
-            "session/new",
-            {"cwd": cwd or self._cwd, "mcpServers": mcp_servers or []},
-            timeout=timeout,
-        )
+        """Create a session scoped to ``cwd`` plus any ``additional_directories``.
+
+        The extra roots are the caller's containment decision and are sent only
+        when they asked for some; capability-gating them is
+        :attr:`supports_additional_directories`' job, one level up.
+        """
+        params: dict[str, Any] = {
+            "cwd": cwd or self._cwd,
+            "mcpServers": mcp_servers or [],
+        }
+        if additional_directories:
+            params["additionalDirectories"] = list(additional_directories)
+        result = self.request("session/new", params, timeout=timeout)
         session_id = result.get("sessionId")
         if not session_id:
             raise AcpProtocolError("session/new returned no sessionId")
@@ -542,20 +563,29 @@ class ClaudeAcpClient:
         mcp_servers: Optional[list] = None,
         on_update: Optional[Callable[[dict], None]] = None,
         timeout: float = 120.0,
+        additional_directories: Optional[list[str]] = None,
     ) -> dict:
         """Rebind an existing agent session.
 
         The agent replays the session's history as ``session/update``
         notifications before replying, so this pumps the inbox exactly like
         :meth:`prompt` does.
+
+        The roots are re-sent here for the same reason the permission mode is
+        re-negotiated on a rebind: they are session state the agent re-derives
+        for the reattached session, so a load that omitted them would silently
+        run the rest of the conversation at a different scope.
         """
+        params: dict[str, Any] = {
+            "sessionId": session_id,
+            "cwd": cwd or self._cwd,
+            "mcpServers": mcp_servers or [],
+        }
+        if additional_directories:
+            params["additionalDirectories"] = list(additional_directories)
         return self._request_pumping(
             "session/load",
-            {
-                "sessionId": session_id,
-                "cwd": cwd or self._cwd,
-                "mcpServers": mcp_servers or [],
-            },
+            params,
             on_update=on_update,
             on_request=None,
             timeout=timeout,
