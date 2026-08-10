@@ -307,11 +307,14 @@ def make_claude_acp_permission_bridge(
             rule_key=hashlib.sha256(
                 request.signature.encode("utf-8")
             ).hexdigest()[:16],
-            # The unconditional floor — the hardline blocklist and the user's
-            # `approvals.deny` rules — is measured on what the runtime DECLARED,
-            # not on the scrubbed/truncated prompt text. Without these two
-            # arguments the gate's yolo bypass would auto-approve a command
-            # Hermes' own shell tool refuses outright.
+            # The unconditional floor — the hardline blocklist, the sudo stdin
+            # guard and the user's `approvals.deny` rules — is measured on what
+            # the runtime DECLARED, not on the scrubbed/truncated prompt text.
+            # Without these two arguments the gate's yolo bypass would
+            # auto-approve a command Hermes' own shell tool refuses outright.
+            # It backstops what the runtime *asks* about: a tool Claude Code's
+            # own settings pre-approve never sends a permission request, so it
+            # never reaches the floor.
             declared_command=request.declared_command,
             declared_paths=request.declared_paths,
         )

@@ -54,6 +54,13 @@ Env vars:
                       parent (a sub-agent's tool use) — the ONLY shape in which
                       adapter 0.66.0 puts ``_meta.claudeCode.toolName`` on the
                       permission request itself
+    ``permission-sudo-stdin``
+                      like ``permission``, but the tool call is a ``Bash``
+                      command piping a guessed password into ``sudo -S`` —
+                      shaped as adapter 0.66.0 shapes one (the command verbatim
+                      in ``rawInput.command`` and copied into ``title``). The
+                      unconditional floor must refuse it AND answer the request,
+                      with no human consulted
     ``permission-after-partial``
                       stream text whose last character could open a ``<think>``
                       tag (so the streaming scrubber holds it back), THEN ask
@@ -408,6 +415,12 @@ def _spawn_grandchild() -> None:
 #: never come into existence — and the user must still be shown it.
 OUTSIDE_WORKSPACE_LOCATION = "/hermes-acp-outside-workspace-should-not-exist.txt"
 
+#: The command the ``permission-sudo-stdin`` mode asks permission for: an
+#: LLM-authored password guess piped into ``sudo -S``. Hermes' own shell tool
+#: refuses this unconditionally, ahead of every bypass, so the delegated floor
+#: has to as well.
+SUDO_STDIN_PASSWORD_GUESS = "echo hunter2 | sudo -S rm -rf /var/log"
+
 _permission_request_counter = 0
 
 
@@ -437,15 +450,28 @@ def _handle_permission(session_id: str, msg: dict) -> None:
     # referenced `tool_call` BEFORE asking, so the client already has the call
     # a permission request points at (issue #851). That update carries
     # `_meta.claudeCode.toolName` unconditionally — unlike the request itself.
-    call = {
-        "toolCallId": "tc-write",
-        # Credential-shaped noise in the human-facing fields: the approval
-        # prompt is user-visible text and must be scrubbed like any other.
-        "title": f"Write permission-probe.txt ({TOOL_OUTPUT_SECRET})",
-        "kind": "edit",
-        "rawInput": {"file_path": target, "token": TOOL_INPUT_SECRET},
-        "locations": [{"path": target}, {"path": OUTSIDE_WORKSPACE_LOCATION}],
-    }
+    if _MODE == "permission-sudo-stdin":
+        tool_name = "Bash"
+        call = {
+            "toolCallId": "tc-bash",
+            # `dist/tools.js` copies a Bash command verbatim into the title, so
+            # this shape carries it in both fields, exactly as 0.66.0 does.
+            "title": SUDO_STDIN_PASSWORD_GUESS,
+            "kind": "execute",
+            "rawInput": {"command": SUDO_STDIN_PASSWORD_GUESS},
+            "locations": [],
+        }
+    else:
+        tool_name = "Write"
+        call = {
+            "toolCallId": "tc-write",
+            # Credential-shaped noise in the human-facing fields: the approval
+            # prompt is user-visible text and must be scrubbed like any other.
+            "title": f"Write permission-probe.txt ({TOOL_OUTPUT_SECRET})",
+            "kind": "edit",
+            "rawInput": {"file_path": target, "token": TOOL_INPUT_SECRET},
+            "locations": [{"path": target}, {"path": OUTSIDE_WORKSPACE_LOCATION}],
+        }
     parented = _MODE == "permission-subagent"
     _update(session_id, {
         "sessionUpdate": "tool_call",
@@ -453,7 +479,7 @@ def _handle_permission(session_id: str, msg: dict) -> None:
         **call,
         "_meta": {
             "claudeCode": {
-                "toolName": "Write",
+                "toolName": tool_name,
                 **({"parentToolUseId": "tc-task"} if parented else {}),
             }
         },
@@ -468,7 +494,7 @@ def _handle_permission(session_id: str, msg: dict) -> None:
         "toolCall": {
             **call,
             **({"_meta": {"claudeCode": {
-                "toolName": "Write", "parentToolUseId": "tc-task",
+                "toolName": tool_name, "parentToolUseId": "tc-task",
             }}} if parented else {}),
         },
         "options": options,
@@ -592,7 +618,10 @@ def _handle_prompt(msg: dict) -> None:
         _send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "refusal"}})
         return
 
-    if _MODE in ("permission", "permission-no-once", "permission-subagent"):
+    if _MODE in (
+        "permission", "permission-no-once", "permission-subagent",
+        "permission-sudo-stdin",
+    ):
         _handle_permission(session_id, msg)
         return
 

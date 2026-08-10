@@ -78,7 +78,7 @@ precedent for this shape.
 | Delegated-runtime early return | `agent/conversation_loop.py:1625` | Add a sibling branch for `api_mode == "claude_code_acp"` |
 | Turn forwarder | `run_agent.py:8070` (`_run_codex_app_server_turn`) | Add `_run_claude_acp_turn` forwarder |
 | Interrupt hook | `run_agent.py:3159` | Route interrupt to `session/cancel` |
-| Steer hook | `run_agent.py:3348` | Decide: queue vs. `promptQueueing` capability |
+| Steer hook | `run_agent.py:3348` | **Decided (Packet 3 fixes):** queue. `_steer_handoff` drains `_pending_steer` into `result["pending_steer"]`, the existing contract all three surfaces already deliver as the *next user turn* — no mid-loop injection, so role alternation holds, and no dependence on the adapter's `promptQueueing` capability |
 | api_mode allow-list | `agent/agent_init.py:637` | Add `"claude_code_acp"` |
 | Runtime module | new `agent/claude_code_runtime.py` | Analogue of `agent/codex_runtime.py` |
 | Session adapter | new `agent/claude_acp_session.py` | Analogue of `codex_app_server_session.py` (**exists, Packet 2**) |
@@ -268,7 +268,9 @@ on every surface (CLI, Discord, Telegram).
 [Packet 3A report](2026-08-10-claude-code-acp-packet3a-report.md) and the
 [Packet 3B report](2026-08-10-claude-code-acp-packet3b-report.md). 3A delivered
 the first scope bullet below (tool activity, streaming, usage) with credential
-scrubbing on every projected field, and two decisions worth carrying forward —
+scrubbing on every projected *display* field (the two raw, never-rendered
+policy-only fields are scoped under "Cross-cutting invariants" below), and two
+decisions worth carrying forward —
 per-turn tokens come from the `session/prompt` reply while `usage_update`
 carries context occupancy (never summed), and Hermes' context compressor is
 deliberately not driven on this runtime (closes Packet 2 R5). 3B replaced the
@@ -312,10 +314,11 @@ open: transcript-level tool rows for curator/memory (3A's R2).
 6. Paths outside the workspace roots are refused
    (`ensure_path_within_roots`, already tested).
 
-**Safety invariants.** Credential scrubbing on every projected event.
-Permissions default to deny for every request Hermes receives. No approval
-bypass introduced. Cancellation never
-leaves an orphan process or a held lease.
+**Safety invariants.** Credential scrubbing on every *projected display* field —
+every tool/permission field that reaches a transcript, a display surface or a
+chat message. Permissions default to deny for every request Hermes receives. No
+approval bypass introduced. Cancellation never leaves an orphan process or a held
+lease.
 
 **Stop condition.** Stop and report if permission requests cannot be delivered
 through the gateway guards without a synthetic mid-loop user message — that
@@ -330,8 +333,18 @@ would break message-role alternation.
   new turn only.
 - **Strict role alternation.** No two same-role messages in a row; no synthetic
   user message injected mid-loop.
-- **Credential scrubbing.** No token, key, or credential value is read, logged,
-  printed, or projected — Packet 0 held this line and later packets must too.
+- **Credential scrubbing.** No token, key, or credential value is printed or
+  projected into a *display* field — every projected display/tool/permission
+  field is scrubbed before truncation. Packet 0 held this line and later packets
+  must too. Two deliberate, named exceptions exist and are scoped in
+  `claude_acp_event_projector`'s module docstring: assistant reply text is
+  accumulated raw (the response must be byte-identical to what the model said;
+  the streaming surfaces scrub downstream), and
+  `PermissionRequest.declared_command` / `.declared_paths` are raw, never
+  rendered, and exist only so the unconditional approval floor measures what the
+  agent declared rather than a redacted rendering of it — the floor logs a
+  truncated declared value at WARNING when it blocks, exactly as
+  `check_all_command_guards` does for Hermes' own shell.
 - **Workspace containment.** Enforced through session roots and permission
   mode.
 - **Deterministic teardown.** Every exit path reaps the adapter and releases

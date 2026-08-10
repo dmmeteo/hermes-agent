@@ -38,6 +38,7 @@ import pytest
 import run_agent
 from tests.agent._fake_claude_acp_adapter import (
     OUTSIDE_WORKSPACE_LOCATION,
+    SUDO_STDIN_PASSWORD_GUESS,
     TOOL_INPUT_SECRET,
     TOOL_OUTPUT_SECRET,
 )
@@ -536,16 +537,18 @@ def _write(path, **extra):
 
 
 class TestUnconditionalFloor:
-    """The two checks that fire BEFORE the yolo bypass must reach this runtime.
+    """The three checks that fire BEFORE the yolo bypass must reach this runtime.
 
-    ``check_dangerous_command`` runs ``detect_hardline_command`` and
+    ``check_all_command_guards`` — the guard Hermes' own shell tool runs — puts
+    ``detect_hardline_command``, ``_check_sudo_stdin_guard`` and
     ``_match_user_deny_rule`` ahead of the ``--yolo`` / ``approvals.mode=off``
     bypass, and ``_user_deny_block_result`` promises the user their deny rule
     holds "not even with --yolo". A delegated runtime asks over a protocol
     instead of through Hermes' tool loop, so the floor has to be re-applied at
     the point where that ask is decided — otherwise Hermes' own shell tool
-    refuses ``rm -rf /`` unconditionally while the same action routed through
-    Claude Code is auto-approved.
+    refuses ``rm -rf /`` (or an LLM-authored ``sudo -S`` password guess)
+    unconditionally while the same action routed through Claude Code is
+    auto-approved.
 
     The floor measures what the runtime *declared*, not the scrubbed and
     truncated display text: a redacted or cut command string is not the command
@@ -564,6 +567,74 @@ class TestUnconditionalFloor:
         assert decision["approved"] is False
         assert decision.get("hardline") is True
         assert "--yolo" in decision["message"]
+
+    def test_a_sudo_stdin_password_guess_is_blocked_even_under_yolo(
+        self, approval_state, monkeypatch
+    ):
+        """The third pre-bypass guard: ``sudo -S`` with no configured password.
+
+        Not a hardline pattern and not a user deny rule — its own check, which
+        ``check_all_command_guards`` deliberately runs before the yolo bypass
+        ("there is never a legitimate reason for the agent to pipe passwords to
+        sudo -S"). A delegated runtime must not be the one place it is optional.
+        """
+        monkeypatch.setattr(approval_state, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setattr(approval_state, "_get_approval_config", lambda: {})
+        monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+
+        decision = approval_state.request_delegated_runtime_approval(
+            "Claude Code", "Bash", "run a command",
+            declared_command=SUDO_STDIN_PASSWORD_GUESS,
+        )
+
+        assert decision["approved"] is False
+        assert "sudo -S" in decision["message"], (
+            "the block must name the guard that fired, not some other check"
+        )
+
+    def test_a_sudo_stdin_password_guess_is_blocked_with_approvals_mode_off(
+        self, approval_state, monkeypatch, cli_surface
+    ):
+        """``approvals.mode: off`` is the other bypass the floor sits ahead of.
+
+        A surface that would answer "allow" is installed on purpose: without the
+        floor this request is approved, so the denial can only come from the
+        floor — and the surface must never be reached.
+        """
+        monkeypatch.setattr(approval_state, "_get_approval_mode", lambda: "off")
+        monkeypatch.setattr(approval_state, "_get_approval_config", lambda: {})
+        monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+        surface = cli_surface("once")
+
+        decision = approval_state.request_delegated_runtime_approval(
+            "Claude Code", "Bash", "run a command",
+            declared_command=SUDO_STDIN_PASSWORD_GUESS,
+        )
+
+        assert decision["approved"] is False
+        assert "sudo -S" in decision["message"]
+        assert surface.prompts == []
+
+    def test_a_configured_sudo_password_keeps_sudo_stdin_usable(
+        self, approval_state, monkeypatch
+    ):
+        """The guard's own carve-out has to survive the reuse.
+
+        With ``SUDO_PASSWORD`` configured, ``sudo -S`` is how Hermes itself
+        drives sudo, so it is not a password guess. Re-deriving the pattern here
+        instead of calling the native guard would lose that distinction and
+        block a supported setup unconditionally.
+        """
+        monkeypatch.setattr(approval_state, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setattr(approval_state, "_get_approval_config", lambda: {})
+        monkeypatch.setenv("SUDO_PASSWORD", "configured-by-the-user")
+
+        decision = approval_state.request_delegated_runtime_approval(
+            "Claude Code", "Bash", "run a command",
+            declared_command="sudo -S systemctl restart nginx",
+        )
+
+        assert decision["approved"] is True
 
     def test_a_declared_command_matching_a_deny_rule_is_blocked_under_yolo(
         self, approval_state, monkeypatch
@@ -638,6 +709,89 @@ class TestUnconditionalFloor:
             "the hardline floor did not reach the delegated runtime: --yolo "
             "auto-approved an unconditionally blocked command"
         )
+
+    def test_the_bridge_blocks_a_sudo_stdin_password_guess(
+        self, approval_state, monkeypatch
+    ):
+        """Same chain as above for the sudo guard: projection → bridge → gate."""
+        monkeypatch.setattr(approval_state, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setattr(approval_state, "_get_approval_config", lambda: {})
+        monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+        from agent.claude_code_runtime import make_claude_acp_permission_bridge
+        from agent.transports.claude_acp_event_projector import (
+            project_permission_request,
+        )
+
+        handler = make_claude_acp_permission_bridge()
+        request = project_permission_request(_params(
+            kind="execute", title=SUDO_STDIN_PASSWORD_GUESS,
+            rawInput={"command": SUDO_STDIN_PASSWORD_GUESS},
+        ))
+
+        assert handler(request) is False, (
+            "the sudo stdin guard did not reach the delegated runtime: --yolo "
+            "auto-approved an LLM-authored password guess that Hermes' own "
+            "shell tool refuses unconditionally"
+        )
+
+    def test_a_sudo_stdin_password_guess_denies_on_the_wire_under_yolo(
+        self, tmp_path, monkeypatch, approval_state, cli_surface
+    ):
+        """The whole chain against a real adapter subprocess, under ``--yolo``.
+
+        A floor block still has to *answer* the request: an unanswered
+        ``session/request_permission`` leaves the adapter waiting until the turn
+        timeout. The installed surface would have said "allow" — the floor is
+        not supposed to consult it at all.
+        """
+        monkeypatch.setattr(approval_state, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setattr(approval_state, "_get_approval_config", lambda: {})
+        monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+        surface = cli_surface("once")
+        record = tmp_path / "record.json"
+        agent = _agent_with(tmp_path, "permission-sudo-stdin", monkeypatch, record)
+        try:
+            result = agent.run_conversation("please clear the logs")
+        finally:
+            agent.close()
+
+        data = _record_data(record)
+        assert data["permission_requests"] == 1
+        assert data["permission_outcome"] == {
+            "outcome": "selected", "optionId": "deny",
+        }, "the floor blocked but never answered the wire"
+        assert data["wrote_file"] is False
+        assert surface.prompts == [], (
+            "an unconditional floor block must not become an approval prompt"
+        )
+        assert result["completed"] is True
+        assert result["error"] is None
+        assert "declined" in result["final_response"].lower()
+
+    def test_a_command_declared_as_argv_is_still_measured(
+        self, approval_state, monkeypatch
+    ):
+        """A command declared as a list is a command, not an absence of one.
+
+        The pinned adapter always sends a string, so this is robustness rather
+        than a live hole — but the old degradation was silent: an unrecognised
+        shape yielded ``""`` and the floor simply did not run.
+        """
+        monkeypatch.setattr(approval_state, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setattr(approval_state, "_get_approval_config", lambda: {})
+        from agent.claude_code_runtime import make_claude_acp_permission_bridge
+        from agent.transports.claude_acp_event_projector import (
+            project_permission_request,
+        )
+
+        handler = make_claude_acp_permission_bridge()
+        request = project_permission_request(_params(
+            kind="execute", title="run",
+            rawInput={"command": ["rm", "-rf", "/"]},
+        ))
+
+        assert request.declared_command == "rm -rf /"
+        assert handler(request) is False
 
     def test_yolo_still_bypasses_the_recoverable_approval_layer(
         self, approval_state, monkeypatch

@@ -4,9 +4,10 @@
 **Branch:** `feat/claude-code-acp-runtime`
 **Clean base:** `510b011dc2` ("docs: review Claude ACP Packet 3")
 **Review answered:** [`2026-08-10-claude-code-acp-packet3-review.md`](2026-08-10-claude-code-acp-packet3-review.md)
-**Status:** complete, **uncommitted** in the worktree. Nothing committed, pushed,
-installed, deployed, or configured; no `config.yaml`, profile, or `.env` was
-touched.
+**Status:** complete. Written and reported while **uncommitted** in the worktree;
+the work — this report included — was subsequently committed as `7f91ac7a50`
+("fix: harden Claude ACP permissions"). Nothing was pushed, installed, deployed,
+or configured; no `config.yaml`, profile, or `.env` was touched.
 
 ## Scope
 
@@ -241,7 +242,10 @@ Note: `ANTHROPIC_BASE_URL` and `CLAUDE_CODE_ACP_BASE_URL` are Tier-2 entries and
 are now stripped too. Neither is consumed by this runtime (the adapter argv and
 auth come from `model.claude_code_acp.*` and the subscription token); a user
 pointing the adapter at a proxy through `ANTHROPIC_BASE_URL` would be relying on
-inheritance that was never part of this provider's contract. Called out in §5 R3.
+inheritance that was never part of this provider's contract. So are
+`AWS_BEARER_TOKEN_BEDROCK`, `GOOGLE_APPLICATION_CREDENTIALS` and
+`VERTEX_CREDENTIALS_PATH` — the Bedrock bearer-token and Vertex auth paths — which
+this note originally omitted. All five are enumerated in §5 R3.
 
 ### M4 — a steer is delivered instead of being accepted and dropped
 
@@ -335,6 +339,18 @@ Plan acceptance checks 2 and 6, which the review marked "Met, with H1/H2" and
 the same pre-bypass floor as a dangerous shell command, the prompt names the tool
 the adapter declared, and the prompt marker sees every declared path.
 
+**Corrected 2026-08-10** (independent re-review M1): as of `7f91ac7a50` the two
+claims above were scoped to `check_dangerous_command`, not to
+`check_all_command_guards` — the guard the terminal tool actually runs, which has
+**three** pre-bypass checks. The floor implemented here carried the hardline
+blocklist and the deny rules but not the sudo stdin guard, so under `--yolo` an
+LLM-authored `echo … | sudo -S …` was auto-approved through the delegated path
+while Hermes' own shell refused it. Closed in the follow-up fix (see
+[`…-packet3-finalfix-report.md`](2026-08-10-claude-code-acp-packet3-finalfix-report.md));
+from that commit on, the claims hold against `check_all_command_guards` too —
+with the standing caveat that the floor only measures the actions the runtime
+*asks* about (a tool Claude Code's own settings pre-approve never asks).
+
 ---
 
 ## 5. Unresolved risks
@@ -343,7 +359,7 @@ the adapter declared, and the prompt marker sees every declared path.
 |---|---|---|
 | R1 | **Broad suites not run**, per instruction — 474 tests across 15 files (ACP, gateway approval, approval core, subprocess env, steer). `tools/approval.py` changed additively and the projector change is reachable only from the permission path, so blast radius should be small, but full `tests/agent`, `tests/tools` and `tests/gateway` runs are outstanding before merge. | Run them in the pre-merge pass. |
 | R2 | **`PermissionRequest` now carries two raw fields.** Documented as policy-only and never rendered, and the signature that used to hold raw-ish material is now a digest — but a future surface that prints the record wholesale would leak a declared path or command. The type is the only guard; nothing enforces it. | If this record ever reaches a new surface, print `description`. Consider a `__repr__` that omits the raw fields if that risk grows. |
-| R3 | **`inherit_credentials=False` also strips `ANTHROPIC_BASE_URL` / `CLAUDE_CODE_ACP_BASE_URL`** (both Tier-2). Neither is consumed by this runtime, but a user who was pointing the adapter at a proxy through the inherited env var would silently lose it. | Mention in the provider docs if a proxy setup is ever supported; the supported knob is `model.claude_code_acp.*`. |
+| R3 | **`inherit_credentials=False` strips more than the two base-URL vars.** The Tier-2 blocklist the narrowing applies also contains, verified against `_build_provider_env_blocklist()`: `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_ACP_BASE_URL`, `AWS_BEARER_TOKEN_BEDROCK` (added for every `auth_type="aws_sdk"` provider), `GOOGLE_APPLICATION_CREDENTIALS` and `VERTEX_CREDENTIALS_PATH` — i.e. exactly how Claude Code authenticates on Bedrock **API-key mode** and on Vertex. Those setups inherited them before this commit. What still works: `CLAUDE_CODE_OAUTH_TOKEN` (explicit `blocked.discard`), classic Bedrock keypair auth (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_PROFILE` are deliberately inheritable) and the `CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX` / region selectors (not on the blocklist). A user who was pointing the adapter at a proxy through `ANTHROPIC_BASE_URL`, or authenticating via bearer token / a GCP service-account JSON, silently loses it. Enumerated 2026-08-10 (re-review L1). | Keep the posture; name these five in the provider docs so a Bedrock/Vertex dogfooder can tell an auth break from a bug. The supported knob is `model.claude_code_acp.*`. |
 | R4 | **The deny-rule-on-paths semantics are new and undocumented for users.** A glob written for commands (`*passwd*`) now also blocks a delegated Write of a path it matches. That is the safer direction, but it is a behaviour a user could be surprised by. | Document `approvals.deny` as covering delegated-runtime paths when the runtime is user-facing (website docs were deliberately not touched here). |
 | R5 | **One pre-existing timing flake observed**: `test_claude_code_runtime.py::TestDeterministicReaping::test_no_orphan_after_an_interrupt` failed once in the RED run at `-j 2`, passed in isolation and in all three subsequent runs of that file. Unrelated to these changes — it is an interrupt/reap race under load. | Watch it; if it recurs, loosen the wall-clock bound or make the reap check event-based. |
 | R6 | **Adapter-side pre-approved tools still invisible** (M3), **no Hermes-side post-cancel grace** (L1), **no transcript tool rows** (M6), **Windows lane still skips whole ACP files** (M5). All deliberate for this slice. | M6 and M5 are cheap and self-contained; M3 needs a product decision (refuse to run, or surface once per session, when the resolved Claude settings pre-allow write/exec tools). |
@@ -353,6 +369,7 @@ the adapter declared, and the prompt marker sees every declared path.
 
 ## 6. Stop point
 
-Stopped here as instructed: no commit, no push, no config/deploy/profile change,
-no adapter pre-approved policy, no transcript tool rows. The worktree holds 15
-modified files plus this report.
+Stopped here as instructed: no push, no config/deploy/profile change, no adapter
+pre-approved policy, no transcript tool rows. The worktree held 15 modified files
+plus this report at the time of writing; that state was committed afterwards as
+`7f91ac7a50`.

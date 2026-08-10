@@ -317,12 +317,23 @@ def _declared_command(tool_call: Dict[str, Any], kind_raw: str) -> str:
     The title is only trusted for the ``execute`` kind — a ``Write``'s title is
     prose ("Write a.py"), not a command, and feeding prose to a shell-syntax
     detector invites blocks nobody can explain.
+
+    An argv list (``["rm", "-rf", "/"]``) is joined rather than ignored. The
+    pinned adapter always sends a string, so this is about the failure mode: a
+    shape the extractor does not recognise returns ``""`` and the policy floor
+    then silently measures nothing.
     """
     raw_input = tool_call.get("rawInput")
     if isinstance(raw_input, dict):
         command = raw_input.get("command")
         if isinstance(command, str) and command.strip():
             return command
+        if isinstance(command, (list, tuple)) and all(
+            isinstance(part, str) for part in command
+        ):
+            joined = " ".join(command).strip()
+            if joined:
+                return joined
     if kind_raw == "execute":
         title = tool_call.get("title")
         if isinstance(title, str) and title.strip():

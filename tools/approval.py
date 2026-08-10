@@ -3576,22 +3576,31 @@ def _delegated_runtime_floor(
     declared_command: str,
     declared_paths,
 ) -> Optional[dict]:
-    """The two checks that fire BEFORE any bypass, for a delegated runtime.
+    """The three checks that fire BEFORE any bypass, for a delegated runtime.
 
-    ``check_dangerous_command`` runs :func:`detect_hardline_command` and
+    ``check_all_command_guards`` — the guard Hermes' own shell tool runs — puts
+    :func:`detect_hardline_command`, :func:`_check_sudo_stdin_guard` and
     :func:`_match_user_deny_rule` ahead of the ``--yolo`` /
     ``approvals.mode=off`` bypass, and :func:`_user_deny_block_result` promises
     the user their rule holds "not even with --yolo". A delegated runtime runs
     its own tool loop, so Hermes never sees the command through
     ``check_all_command_guards`` — the floor has to be re-applied where the
     runtime *asks*, or the promise is void for every Bash/Write the adapter
-    performs.
+    performs. All three are the *native* guards, called here rather than
+    re-derived, so each keeps its own carve-outs (notably: ``sudo -S`` is
+    legitimate once the user has configured ``SUDO_PASSWORD``).
+
+    What this floor does NOT cover: it only measures the actions the runtime
+    *asks* about. A tool the runtime's own engine pre-approves (its settings
+    files, its own permission mode) never produces a permission request, so it
+    never reaches this function at all — the floor is a backstop on the ask, not
+    an interceptor on the runtime's tool calls.
 
     What is measured, and why the two inputs are treated differently:
 
     * ``declared_command`` — the runtime's own command text, verbatim (never the
       scrubbed/truncated display form: a redacted command is not the command).
-      Both checks apply, exactly as for Hermes' own shell tool.
+      All three checks apply, exactly as for Hermes' own shell tool.
     * ``declared_paths`` — the files the action names. Only the user's deny
       globs apply. The hardline blocklist is written against shell syntax and
       matches on substrings, so a bare path trips it by name alone
@@ -3613,6 +3622,17 @@ def _delegated_runtime_floor(
             # tells the model to `bash` it, which is Hermes-tool advice for an
             # agent that lives inside the adapter and only ever learns "denied".
             return _hardline_block_result(hardline_desc)
+
+        # Same unconditional standing as the hardline floor: an LLM-authored
+        # `sudo -S` is a password-guessing loop, and the delegated runtime is
+        # not the one place it gets to run under --yolo.
+        is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(declared_command)
+        if is_sudo_guess:
+            logger.warning(
+                "Sudo stdin guard block: %s (%s asked to run '%s': %s)",
+                sudo_guess_desc, runtime, action, declared_command[:200],
+            )
+            return _sudo_stdin_block_result(sudo_guess_desc)
 
     for text in (declared_command, *(declared_paths or ())):
         if not isinstance(text, str) or not text.strip():
@@ -3658,10 +3678,11 @@ def request_delegated_runtime_approval(
             pass a signature of *what is being asked* so answering "always" to
             one action cannot blanket a different one on the same tool.
         declared_command: The runtime's own command text, verbatim. Measured
-            against the unconditional floor (hardline blocklist + the user's
-            ``approvals.deny`` rules) BEFORE the recoverable approval layer, so
-            those two checks mean the same thing here as they do for Hermes'
-            own shell tool. See :func:`_delegated_runtime_floor`.
+            against the unconditional floor (hardline blocklist + the sudo
+            stdin guard + the user's ``approvals.deny`` rules) BEFORE the
+            recoverable approval layer, so those three checks mean the same
+            thing here as they do for Hermes' own shell tool — for the actions
+            the runtime asks about. See :func:`_delegated_runtime_floor`.
         declared_paths: The raw paths the action names, measured against the
             user's deny rules only (see :func:`_delegated_runtime_floor`).
         approval_callback: Optional CLI callback (same contract as elsewhere).
