@@ -1003,6 +1003,12 @@ def resolve_billing_route(
 
     if provider_name == "openai-codex":
         return BillingRoute(provider="openai-codex", model=model, base_url=base_url or "", billing_mode="subscription_included")
+    # Claude Code over ACP bills the user's Claude subscription, not an API
+    # account — the adapter is explicitly denied the API-billing credentials
+    # (agent/transports/claude_acp.py). Pricing its tokens off the Anthropic
+    # API table would invent a charge the user never incurs.
+    if provider_name in {"claude-code-acp", "claude-acp", "claude-code-agent"}:
+        return BillingRoute(provider="claude-code-acp", model=model, base_url=base_url or "", billing_mode="subscription_included")
     if provider_name == "openrouter" or base_url_host_matches(base_url or "", "openrouter.ai"):
         return BillingRoute(provider="openrouter", model=model, base_url=base_url or "", billing_mode="official_models_api")
     if provider_name == "nous" or base_url_host_matches(base_url or "", "inference-api.nousresearch.com"):

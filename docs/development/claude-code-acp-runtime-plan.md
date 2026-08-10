@@ -4,7 +4,9 @@
 remediation pass against an independent review (findings F1–F9, F13, F15).
 Packet 2 complete — see
 [`2026-08-10-claude-code-acp-packet2-report.md`](2026-08-10-claude-code-acp-packet2-report.md).
-Packet 3 not started.
+Packet 3 **slice 3A (event projection) complete** — see
+[`2026-08-10-claude-code-acp-packet3a-report.md`](2026-08-10-claude-code-acp-packet3a-report.md);
+permission bridging is the remaining Packet 3 work and is not started.
 **Branch:** `feat/claude-code-acp-runtime`
 **Spike report:** [`2026-08-09-claude-code-acp-packet0-spike.md`](2026-08-09-claude-code-acp-packet0-spike.md)
 
@@ -63,7 +65,7 @@ precedent for this shape.
 | Runtime module | new `agent/claude_code_runtime.py` | Analogue of `agent/codex_runtime.py` |
 | Session adapter | new `agent/claude_acp_session.py` | Analogue of `codex_app_server_session.py` (**exists, Packet 2**) |
 | Session binding + turn lease | new `agent/claude_acp_binding.py` | ACP session id + lease on the Hermes `sessions.model_config` row (**exists, Packet 2**) |
-| Event projection | new `agent/transports/claude_acp_event_projector.py` | Analogue of `codex_event_projector.py` |
+| Event projection | new `agent/transports/claude_acp_event_projector.py` | Analogue of `codex_event_projector.py` (**exists, Packet 3A**), consumed through the `event_sink` seam on `ClaudeAcpSession.run_turn` and the bridge in `claude_code_runtime.make_claude_acp_event_bridge` |
 | Wire client | `agent/transports/claude_acp.py` | **Exists (Packet 0)** |
 | Provider surface | `plugins/model-providers/claude-code-acp/__init__.py` | `register_provider(ProviderProfile(api_mode="claude_code_acp", auth_type="external_process"))`. NOT `claude-code/` — the `anthropic` profile already owns the `claude-code` alias. |
 | Setup/install UX | `hermes_cli/model_setup_flows.py`, `hermes_cli/claude_acp_install.py` | Adapter presence check + managed install via `hermes model` (NOT `hermes tools`, which only toggles toolsets) |
@@ -241,10 +243,20 @@ transcript state into an ACP-side store — that breaks the ownership split.
 **Goal.** Tool activity, approvals, and cancellation behave like native Hermes
 on every surface (CLI, Discord, Telegram).
 
+**Progress.** Slice **3A (event projection) is complete** — see the
+[Packet 3A report](2026-08-10-claude-code-acp-packet3a-report.md). Delivered:
+the first scope bullet below (tool activity, streaming, usage), with credential
+scrubbing on every projected field, and two decisions worth carrying forward —
+per-turn tokens come from the `session/prompt` reply while `usage_update`
+carries context occupancy (never summed), and Hermes' context compressor is
+deliberately not driven on this runtime (closes Packet 2 R5). Still open:
+permission bridging (the blanket denial from Packet 1 stands), the gateway
+guard bypass, and transcript-level tool rows for curator/memory.
+
 **Scope.**
 - Project `tool_call` / `tool_call_update` into Hermes' tool-activity display;
   `agent_message_chunk` into streaming output; `usage_update` into usage
-  accounting.
+  accounting. ✅ **slice 3A**
 - Bridge `session/request_permission` to Hermes' existing approval flow,
   including the gateway's two message guards (base adapter `_pending_messages`
   and the `gateway/run.py` runner) — both must be bypassed for approvals.

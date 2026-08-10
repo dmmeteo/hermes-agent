@@ -34,9 +34,15 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from agent.claude_acp_binding import BindingStore, TurnLease
+
+if TYPE_CHECKING:  # import-time cost stays off the hot path
+    from agent.transports.claude_acp_event_projector import (
+        ProjectedEvent,
+        UsageSnapshot,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +83,14 @@ class AcpTurnOutcome:
     #: The ACP session was rebuilt for this turn, so the caller must surface
     #: exactly one reseed marker.
     reseeded: bool = False
+    #: Completed tool calls the adapter reported, for the skill-nudge counter
+    #: the chat-completions loop ticks per tool iteration.
+    tool_iterations: int = 0
+    #: The ``usage`` block on the ``session/prompt`` reply — ACP's authoritative
+    #: per-turn token counts. ``None`` when the agent reported none.
+    usage: Optional[Dict[str, Any]] = None
+    #: Latest ``usage_update``: context occupancy and cost, NOT per-turn tokens.
+    context_usage: Optional["UsageSnapshot"] = None
 
 
 @dataclass
@@ -347,12 +361,17 @@ class ClaudeAcpSession:
         *,
         recap_provider: Optional[Callable[[], str]] = None,
         cancel_pending: bool = False,
+        event_sink: Optional[Callable[["ProjectedEvent"], None]] = None,
     ) -> AcpTurnOutcome:
         """Run one turn on this conversation's Claude Code session.
 
         The turn lease is taken before anything is spawned — a lease conflict
         must not start a second adapter against a session another process is
         already driving — and released on every exit path, success or not.
+
+        ``event_sink`` receives each ``ProjectedEvent`` the projector produces,
+        in arrival order. It is the runtime's seam onto Hermes' display
+        surfaces; this class stays free of any knowledge of them.
         """
         turn = _TurnState()
         if cancel_pending:
@@ -396,19 +415,28 @@ class ClaudeAcpSession:
             # stray notification) and must not be read as this turn's output.
             client.drain_inbox()
 
-            text_parts: List[str] = []
+            from agent.transports.claude_acp_event_projector import (
+                ClaudeAcpEventProjector,
+            )
+
+            # The projector owns the event→surface mapping and the strict
+            # assistant-text allow-list: only `agent_message_chunk` becomes
+            # reply text, so a structured payload (tool_call, thought, replayed
+            # user text, plan) can never leak into it — the exact direct-CLI
+            # failure this runtime replaces.
+            projector = ClaudeAcpEventProjector()
 
             def _on_update(update: Dict[str, Any]) -> None:
-                # Assistant text only. tool_call / tool_call_update /
-                # agent_thought_chunk carry structured payloads that must
-                # never reach the user-visible response — leaking them as text
-                # was exactly the direct-CLI failure this runtime replaces.
-                # Packet 3 projects them into the tool-activity display.
-                if update.get("sessionUpdate") != "agent_message_chunk":
+                event = projector.project(update)
+                if event.kind == "ignored" or event_sink is None:
                     return
-                content = update.get("content") or {}
-                if content.get("type") == "text":
-                    text_parts.append(content.get("text", ""))
+                try:
+                    event_sink(event)
+                except Exception:
+                    # A display surface must never break the turn it observes,
+                    # and must never cost us the accumulated reply — which the
+                    # projector already recorded before we got here.
+                    logger.debug("ACP event sink raised", exc_info=True)
 
             try:
                 result = client.prompt(
@@ -428,8 +456,13 @@ class ClaudeAcpSession:
                     logger.debug("cancel-on-teardown failed", exc_info=True)
                 raise
 
-            outcome.text = "".join(text_parts)
+            outcome.text = projector.assistant_text
             outcome.stop_reason = result.get("stopReason")
+            outcome.tool_iterations = projector.tool_iterations
+            outcome.context_usage = projector.usage
+            reported_usage = result.get("usage")
+            if isinstance(reported_usage, dict) and reported_usage:
+                outcome.usage = reported_usage
             try:
                 self.stderr_tail = client.stderr_tail()
             except Exception:

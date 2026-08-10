@@ -50,6 +50,16 @@ Env vars:
                       ignore any ``session/cancel`` that arrived before the
                       prompt was dispatched, and only honour one received
                       afterwards — what a real adapter may legitimately do
+    ``tools``         emit the full typed-event zoo a real turn produces:
+                      ``tool_call`` / ``tool_call_update`` (including a failed
+                      one and an update-only one), credential-shaped values in
+                      ``rawInput`` / ``rawOutput`` / ``title``,
+                      ``user_message_chunk``, ``agent_thought_chunk``,
+                      ``plan``, ``available_commands_update``,
+                      ``usage_update``, and a ``usage`` block on the reply
+    ``partial-tag``   answer with text whose last character could start a
+                      ``<think>`` tag, so the streaming scrubber holds it back
+                      until the turn is flushed
 """
 
 from __future__ import annotations
@@ -171,6 +181,122 @@ def _ask_client(request_id: int, method: str, params: dict) -> dict:
         return _pending_replies.pop(request_id)
 
 
+# Credential-shaped values planted in tool payloads. The projector surfaces
+# tool activity on Hermes' display callbacks, so every field it touches must be
+# scrubbed; the tests assert these literals never reach a callback.
+TOOL_INPUT_SECRET = "sk-ant-api03-FAKEINPUTSECRET0123456789"
+TOOL_OUTPUT_SECRET = "ghp_FAKEOUTPUTSECRET0123456789abcd"
+
+# Per-turn token usage on the `session/prompt` reply, which is where ACP
+# reports authoritative counts (`usage_update` carries context occupancy and
+# cost, not per-turn deltas). totalTokens is the sum of the four buckets.
+TURN_USAGE = {
+    "inputTokens": 120,
+    "outputTokens": 30,
+    "cachedReadTokens": 900,
+    "cachedWriteTokens": 15,
+    "thoughtTokens": 7,
+    "totalTokens": 1065,
+}
+
+# Context occupancy reported mid-turn. `used` is NOT a per-turn token count —
+# summing it into session token totals is the mistake the tests guard against.
+CONTEXT_USED_TOKENS = 1234
+CONTEXT_WINDOW_TOKENS = 200000
+TURN_COST_USD = 0.42
+
+# A path the agent reports as a tool location. Projection is display-only, so
+# this file must never come into existence.
+REPORTED_LOCATION = "reported-but-absent.txt"
+
+
+def _handle_typed_events(session_id: str, msg: dict) -> None:
+    """Emit the typed session/update zoo, then finish the turn."""
+    if _MODE == "partial-tag":
+        _text(session_id, "trailing bracket <")
+        _send({"jsonrpc": "2.0", "id": msg["id"],
+               "result": {"stopReason": "end_turn", "usage": dict(TURN_USAGE)}})
+        return
+
+    _text(session_id, "Reading. ")
+    _update(session_id, {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "tc-read",
+        "title": f"Read notes.txt with key {TOOL_INPUT_SECRET}",
+        "kind": "read",
+        "status": "pending",
+        "rawInput": {"file_path": "notes.txt", "api_key": TOOL_INPUT_SECRET},
+        "locations": [{"path": os.path.join(os.getcwd(), REPORTED_LOCATION)}],
+        "_meta": {"claudeCode": {"toolName": "Read"}},
+    })
+    _update(session_id, {"sessionUpdate": "tool_call_update",
+                         "toolCallId": "tc-read", "status": "in_progress"})
+    _update(session_id, {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "tc-read",
+        "status": "completed",
+        "rawOutput": {"content": f"42 (token {TOOL_OUTPUT_SECRET})"},
+    })
+    # A tool that fails: the display must say so rather than reporting success.
+    _update(session_id, {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "tc-bash",
+        "title": "Run the tests",
+        "kind": "execute",
+        "status": "pending",
+        "rawInput": {"command": "pytest -x"},
+        "_meta": {"claudeCode": {"toolName": "Bash"}},
+    })
+    _update(session_id, {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "tc-bash",
+        "status": "failed",
+        "rawOutput": {"stderr": "1 failed"},
+    })
+    # A tool the client only ever sees as an update — the shape a replayed or
+    # coalesced tool call arrives in, where there is no preceding tool_call.
+    _update(session_id, {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "tc-orphan",
+        "status": "completed",
+        "title": "Grep for TODO",
+        "kind": "search",
+        "rawInput": {"pattern": "TODO"},
+        "rawOutput": "3 matches",
+        "_meta": {"claudeCode": {"toolName": "Grep"}},
+    })
+    # A tool that is already finished when the client first sees it — the shape
+    # a very fast call takes. It never gets its own opening event on the wire.
+    _update(session_id, {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "tc-instant",
+        "title": "List the workspace",
+        "kind": "search",
+        "status": "completed",
+        "rawInput": {"path": "."},
+        "rawOutput": "2 entries",
+        "_meta": {"claudeCode": {"toolName": "Glob"}},
+    })
+    # Everything below carries text that is NOT the assistant's reply. None of
+    # it may reach the response or the streaming surface.
+    _update(session_id, {"sessionUpdate": "user_message_chunk",
+                         "content": {"type": "text", "text": "ECHOED-USER-PROMPT"}})
+    _update(session_id, {"sessionUpdate": "agent_thought_chunk",
+                         "content": {"type": "text", "text": "THOUGHT-not-response"}})
+    _update(session_id, {"sessionUpdate": "plan", "entries": [
+        {"content": "PLAN-ENTRY", "priority": "high", "status": "pending"}]})
+    _update(session_id, {"sessionUpdate": "available_commands_update",
+                         "availableCommands": [
+                             {"name": "compact", "description": "COMMAND-DESC"}]})
+    _update(session_id, {"sessionUpdate": "usage_update",
+                         "used": CONTEXT_USED_TOKENS,
+                         "size": CONTEXT_WINDOW_TOKENS,
+                         "cost": {"amount": TURN_COST_USD, "currency": "USD"}})
+    _text(session_id, "Done.")
+    _send({"jsonrpc": "2.0", "id": msg["id"],
+           "result": {"stopReason": "end_turn", "usage": dict(TURN_USAGE)}})
+
+
 def _spawn_grandchild() -> None:
     """A descendant that outlives the adapter unless the whole tree is killed."""
     child = subprocess.Popen(
@@ -288,6 +414,10 @@ def _handle_prompt(msg: dict) -> None:
         prior.append(_prompt_text(params))
         _store_write(session_id, {"prompts": prior})
         _send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}})
+        return
+
+    if _MODE in ("tools", "partial-tag"):
+        _handle_typed_events(session_id, msg)
         return
 
     if _MODE == "error":

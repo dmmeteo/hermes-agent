@@ -617,6 +617,13 @@ class ClaudeAcpClient:
         deadline = time.monotonic() + timeout
         while True:
             if entry.event.is_set():
+                # Anything already queued arrived BEFORE this reply — one
+                # ordered stdio stream, one reader thread — so it belongs to
+                # this request and must still be handled. Returning straight
+                # from the reply drops it: an `agent_message_chunk` emitted
+                # immediately before `stopReason` would silently vanish from
+                # the response, and a tool's completion event with it.
+                self._drain_pending(on_update, on_request)
                 return self._unwrap(entry.box)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -634,6 +641,27 @@ class ClaudeAcpClient:
                 if entry.event.wait(1.0):
                     return self._unwrap(entry.box)
                 raise AcpProtocolError("ACP child exited mid-turn")
+            self._handle_inbox_message(msg, on_update, on_request)
+
+    def _drain_pending(
+        self,
+        on_update: Optional[Callable[[dict], None]],
+        on_request: Optional[Callable[[str, dict], dict]],
+    ) -> None:
+        """Handle every message queued right now, then return.
+
+        Used when a reply lands: the tail of the request's own notifications
+        can already be sitting in the inbox. The EOF sentinel is preserved —
+        dropping it would hide a dead child from the next request loop.
+        """
+        while True:
+            try:
+                msg = self._inbox.get_nowait()
+            except queue.Empty:
+                return
+            if msg is None:
+                self._inbox.put(None)
+                return
             self._handle_inbox_message(msg, on_update, on_request)
 
     def _handle_inbox_message(

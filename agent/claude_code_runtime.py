@@ -15,25 +15,35 @@ Scope through Packet 2 (see
   history, which would break the adapter's own prompt cache. The single
   exception is a bounded recap after a reseed, when the Claude-side session
   could not be reattached at all
-* ``agent_message_chunk`` text is assembled into the normal Hermes response;
-  tool and thought events are consumed but not projected
+* ``agent_message_chunk`` text is assembled into the normal Hermes response
 
-Rich tool projection and permission UX are Packet 3.
+Packet 3 slice 3A adds typed event projection on top of that: tool activity
+reaches the same display callbacks Hermes' own tool loop fires, assistant text
+also streams, thoughts reach the reasoning surface, and token usage reaches
+Hermes' usage accounting. The permission UX is still Packet 3's remaining work
+— every ``session/request_permission`` continues to be denied.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from agent.claude_acp_binding import BindingStore, TurnLeaseConflict
 from agent.claude_acp_session import ClaudeAcpSession, ClaudeCodeAuthRequired
+
+if TYPE_CHECKING:  # display projection types; no import-time cost
+    from agent.transports.claude_acp_event_projector import (
+        ProjectedEvent,
+        ToolActivity,
+    )
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "ClaudeCodeAuthRequired",
     "RESEED_MARKER",
+    "make_claude_acp_event_bridge",
     "resolve_adapter_argv",
     "run_claude_code_acp_turn",
 ]
@@ -154,6 +164,265 @@ def _build_recap(messages: List[Dict[str, Any]]) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Event bridge — projected ACP events onto Hermes' display surfaces.
+#
+# The delegated runtime bypasses Hermes' tool loop, so none of the callbacks
+# that loop fires happen on their own. Without this bridge a Claude Code turn
+# is a silent channel until the final answer lands: no tool bubbles in the CLI,
+# no tool cards in the TUI/desktop, no live text on Discord/Telegram. The
+# bridge fires exactly the callbacks `agent/tool_executor.py` fires for a
+# native tool call — nothing new is invented for this runtime.
+# ---------------------------------------------------------------------------
+
+
+def make_claude_acp_event_bridge(agent) -> Callable[["ProjectedEvent"], None]:
+    """Build the ``event_sink`` that renders projected ACP events.
+
+    Returns a callable taking one ``ProjectedEvent``. Every callback invocation
+    is guarded: a buggy display surface must not tear down the turn it is
+    observing.
+    """
+
+    def _fire(name: str, call: Any, *args: Any, **kwargs: Any) -> None:
+        cb = getattr(agent, name, None)
+        if cb is None:
+            return
+        try:
+            call(cb, *args, **kwargs)
+        except Exception:
+            logger.debug("%s raised on a projected ACP event", name, exc_info=True)
+
+    def _tool_started(tool: "ToolActivity") -> None:
+        _fire(
+            "tool_progress_callback",
+            lambda cb: cb("tool.started", tool.name, tool.preview, tool.args),
+        )
+        # Stable-id tool card (TUI / desktop), alongside the progress bubble —
+        # the same pair the native path emits, so a card stays correlated with
+        # its completion.
+        _fire(
+            "tool_start_callback",
+            lambda cb: cb(tool.call_id, tool.name, tool.args),
+        )
+
+    def _tool_completed(tool: "ToolActivity") -> None:
+        if tool.needs_start:
+            # Never seen as a `tool_call`: open the card before closing it.
+            _tool_started(tool)
+        _fire(
+            "tool_progress_callback",
+            lambda cb: cb(
+                "tool.completed", tool.name, None, None,
+                duration=tool.duration, is_error=tool.is_error, result=tool.result,
+            ),
+        )
+        _fire(
+            "tool_complete_callback",
+            lambda cb: cb(tool.call_id, tool.name, tool.args, tool.result),
+        )
+
+    def sink(event: "ProjectedEvent") -> None:
+        kind = event.kind
+        if kind == "text":
+            _fire("_fire_stream_delta", lambda cb: cb(event.text))
+        elif kind == "thought":
+            _fire("_fire_reasoning_delta", lambda cb: cb(event.text))
+        elif kind == "tool_started":
+            _tool_started(event.tool)
+        elif kind == "tool_completed":
+            _tool_completed(event.tool)
+        # "tool_updated" (a non-terminal status change) and "usage" have no
+        # live Hermes surface: usage is recorded once at turn end, and Hermes'
+        # tool display is a started/completed pair.
+
+    return sink
+
+
+def _flush_stream_surface(agent) -> None:
+    """Release any text the streaming scrubbers are holding back.
+
+    The scrubbers hold a trailing partial tag (a bare ``<`` that might open
+    ``<think>``) until the next delta resolves it. On this path there is no
+    next delta, and a surface that already streamed the reply does not
+    re-render it — so an unflushed tail is text the user never sees.
+    """
+    flush = getattr(agent, "_reset_stream_delivery_tracking", None)
+    if flush is None:
+        return
+    try:
+        flush()
+    except Exception:
+        logger.debug("stream delivery flush raised", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Usage accounting.
+#
+# ACP reports usage twice over, and the two are NOT interchangeable:
+#
+# * the ``session/prompt`` reply carries ``usage`` — this turn's token counts
+#   (input / output / cached read / cached write / total). Authoritative.
+# * ``usage_update`` notifications carry ``used`` + ``size`` + ``cost`` —
+#   how much of the context window the session now occupies. Several arrive per
+#   turn and each restates occupancy, so summing them into token counters
+#   would inflate session accounting by orders of magnitude.
+#
+# Tokens therefore come from the reply, occupancy is reported as its own pair
+# of fields, and the projector keeps only the last occupancy snapshot.
+# ---------------------------------------------------------------------------
+
+
+def _coerce_usage_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(value, 0)
+    if isinstance(value, float):
+        return max(int(value), 0)
+    if isinstance(value, str):
+        try:
+            return max(int(value), 0)
+        except ValueError:
+            return 0
+    return 0
+
+
+def _record_usage(agent, outcome: Any) -> Dict[str, Any]:
+    """Project one turn's ACP usage into Hermes' accounting.
+
+    Mirrors ``_record_codex_app_server_usage`` (session counters, cost
+    estimation, the SessionDB token queue) with two deliberate differences:
+
+    * ``session_api_calls`` is ticked by the caller, not here, so the count
+      stays correct on the failure paths that never reach this function.
+    * Hermes' **context compressor is not driven**. Claude Code owns its own
+      context window and compacts it itself, and Hermes never replays its
+      transcript into the adapter — so feeding the compressor would rewrite
+      Hermes' past context (the one cache-invalidating operation we allow) to
+      solve a problem that lives on the other side of the boundary. This
+      resolves Packet 2's R5 by decision rather than leaving it implicit.
+    """
+    usage = getattr(outcome, "usage", None)
+    context_usage = getattr(outcome, "context_usage", None)
+
+    result: Dict[str, Any] = {}
+    if context_usage is not None:
+        result["context_used_tokens"] = context_usage.context_used_tokens
+        result["context_window_tokens"] = context_usage.context_window_tokens
+        if context_usage.cost_amount is not None:
+            # Reported, never added to the session cost: the adapter's figure is
+            # what the turn would have cost on API billing, while a
+            # subscription turn costs the user nothing extra.
+            result["adapter_reported_cost_usd"] = context_usage.cost_amount
+            result["adapter_reported_cost_currency"] = context_usage.cost_currency
+
+    if not isinstance(usage, dict) or not usage:
+        # No usage for this turn: still persist the api-call tick so session
+        # accounting does not lose the turn entirely.
+        _queue_token_counts(agent, None, None)
+        return result
+
+    from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+
+    canonical = CanonicalUsage(
+        input_tokens=_coerce_usage_int(usage.get("inputTokens")),
+        output_tokens=_coerce_usage_int(usage.get("outputTokens")),
+        cache_read_tokens=_coerce_usage_int(usage.get("cachedReadTokens")),
+        cache_write_tokens=_coerce_usage_int(usage.get("cachedWriteTokens")),
+        reasoning_tokens=_coerce_usage_int(usage.get("thoughtTokens")),
+        raw_usage=usage,
+    )
+    reported_total = _coerce_usage_int(usage.get("totalTokens"))
+    prompt_tokens = canonical.prompt_tokens
+    completion_tokens = canonical.output_tokens
+    total_tokens = reported_total or canonical.total_tokens
+    usage_dict = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "input_tokens": canonical.input_tokens,
+        "output_tokens": canonical.output_tokens,
+        "cache_read_tokens": canonical.cache_read_tokens,
+        "cache_write_tokens": canonical.cache_write_tokens,
+        "reasoning_tokens": canonical.reasoning_tokens,
+    }
+
+    agent.session_prompt_tokens += prompt_tokens
+    agent.session_completion_tokens += completion_tokens
+    agent.session_total_tokens += total_tokens
+    agent.session_input_tokens += canonical.input_tokens
+    agent.session_output_tokens += canonical.output_tokens
+    agent.session_cache_read_tokens += canonical.cache_read_tokens
+    agent.session_cache_write_tokens += canonical.cache_write_tokens
+    agent.session_reasoning_tokens += canonical.reasoning_tokens
+
+    cost_result = estimate_usage_cost(
+        agent.model,
+        canonical,
+        provider=agent.provider,
+        base_url=agent.base_url,
+        api_key=getattr(agent, "api_key", ""),
+    )
+    if cost_result.amount_usd is not None:
+        agent.session_estimated_cost_usd += float(cost_result.amount_usd)
+    agent.session_cost_status = cost_result.status
+    agent.session_cost_source = cost_result.source
+
+    _queue_token_counts(agent, canonical, cost_result)
+
+    result.update(usage_dict)
+    result["last_prompt_tokens"] = prompt_tokens
+    result["estimated_cost_usd"] = (
+        float(cost_result.amount_usd) if cost_result.amount_usd is not None else None
+    )
+    result["cost_status"] = cost_result.status
+    result["cost_source"] = cost_result.source
+    return result
+
+
+def _queue_token_counts(agent, canonical: Any, cost_result: Any) -> None:
+    """Hand this turn's counts to the SessionDB background writer."""
+    if not getattr(agent, "_session_db", None) or not getattr(agent, "session_id", ""):
+        return
+    try:
+        if not agent._session_db_created:
+            agent._ensure_db_session()
+        if canonical is None:
+            agent._session_db.queue_token_counts(
+                agent.session_id,
+                model=agent.model,
+                billing_provider=agent.provider,
+                billing_base_url=agent.base_url,
+                billing_mode="subscription_included",
+                api_call_count=1,
+            )
+            return
+        agent._session_db.queue_token_counts(
+            agent.session_id,
+            input_tokens=canonical.input_tokens,
+            output_tokens=canonical.output_tokens,
+            cache_read_tokens=canonical.cache_read_tokens,
+            cache_write_tokens=canonical.cache_write_tokens,
+            reasoning_tokens=canonical.reasoning_tokens,
+            estimated_cost_usd=float(cost_result.amount_usd)
+            if cost_result.amount_usd is not None else None,
+            cost_status=cost_result.status,
+            cost_source=cost_result.source,
+            billing_provider=agent.provider,
+            billing_base_url=agent.base_url,
+            billing_mode="subscription_included"
+            if cost_result.status == "included" else None,
+            model=agent.model,
+            api_call_count=1,
+        )
+    except Exception as exc:
+        logger.debug(
+            "Claude Code ACP token persistence failed (session=%s): %s",
+            getattr(agent, "session_id", None), exc,
+        )
+
+
 def _get_or_create_session(agent, argv: list[str], cwd: str) -> ClaudeAcpSession:
     """The one live ACP session for this Hermes conversation.
 
@@ -225,6 +494,7 @@ def run_claude_code_acp_turn(
             # latched flag into the turn so the cancel goes out as soon as a
             # session exists.
             cancel_pending=bool(getattr(agent, "_interrupt_requested", False)),
+            event_sink=make_claude_acp_event_bridge(agent),
         )
     except TurnLeaseConflict as exc:
         # Refuse rather than spawning a second adapter against a session
@@ -253,6 +523,9 @@ def run_claude_code_acp_turn(
             agent, messages,
             f"Claude Code ACP turn failed: {exc}{_diagnostics(session)}",
         )
+
+    # Streaming ended with this turn: release whatever the scrubbers held back.
+    _flush_stream_surface(agent)
 
     final_text = outcome.text
     stop_reason = outcome.stop_reason
@@ -319,6 +592,7 @@ def run_claude_code_acp_turn(
         agent._claude_acp_session = None
 
     agent.session_api_calls = getattr(agent, "session_api_calls", 0) + 1
+    usage_result = _record_usage(agent, outcome)
     _run_improvement_hooks(
         agent,
         original_user_message=original_user_message,
@@ -326,6 +600,7 @@ def run_claude_code_acp_turn(
         messages=messages,
         should_review_memory=should_review_memory,
         succeeded=not cancelled and error is None,
+        tool_iterations=outcome.tool_iterations,
     )
 
     return {
@@ -341,6 +616,7 @@ def run_claude_code_acp_turn(
         # must not write it again — append_message has no dedup and a second
         # write would duplicate the already-flushed user turn (#860/#42039).
         "agent_persisted": True,
+        **usage_result,
     }
 
 
@@ -352,16 +628,23 @@ def _run_improvement_hooks(
     messages: List[Dict[str, Any]],
     should_review_memory: bool,
     succeeded: bool,
+    tool_iterations: int = 0,
 ) -> None:
     """Delegated-runtime parity for the agent-improvement loop.
 
     The codex app-server runtime performs exactly these four steps after a
     turn (``agent/codex_runtime.py``). Without them, selecting Claude Code
     silently disables skill nudges, external-memory sync, and background
-    review for the whole session. This runtime owns one adapter-side
-    iteration per turn, so the skill counter advances by one.
+    review for the whole session.
+
+    The skill counter advances by the number of tool calls the adapter actually
+    made (codex does the same with its own ``tool_iterations``), falling back to
+    one for a turn that used no tools — the nudge gate is "iterations since the
+    last skill review", and a 30-tool turn is not one iteration of work.
     """
-    agent._iters_since_skill = getattr(agent, "_iters_since_skill", 0) + 1
+    agent._iters_since_skill = (
+        getattr(agent, "_iters_since_skill", 0) + max(tool_iterations, 1)
+    )
 
     should_review_skills = False
     try:
@@ -418,6 +701,9 @@ def _failure_result(
     agent, messages: List[Dict[str, Any]], message: str
 ) -> Dict[str, Any]:
     """Uniform failure shape that also clears a latched interrupt."""
+    # A failure can land after some text already streamed; release whatever the
+    # scrubbers are still holding so the surface is not left mid-delta.
+    _flush_stream_surface(agent)
     _user_interrupted = bool(getattr(agent, "_interrupt_requested", False))
     _interrupt_message = (
         getattr(agent, "_interrupt_message", None) if _user_interrupted else None
