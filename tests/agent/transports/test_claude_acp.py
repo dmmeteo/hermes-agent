@@ -144,6 +144,64 @@ class TestModelSelection:
             client.set_config_option(session_id, "not-an-option", "x")
 
 
+class TestPermissionModeState:
+    """Packet 5 slice A: the session's permission mode, read off ``modes``.
+
+    Unlike the model, ACP gives this a first-class field on the session
+    response (``{currentModeId, availableModes}``) and its own change
+    notification, so the client reads that block rather than the generic
+    ``configOptions`` list — whose inert "mode" entry is not the same thing.
+    The client only reports; ``agent/claude_acp_permissions.py`` decides.
+    """
+
+    def test_no_mode_state_before_any_session(self, client):
+        """``None``, not ``[]``: nothing has told this client anything about
+        modes, which must not read as "this session advertises none" — the
+        policy narrows a configured mode away in both cases, but only one of
+        them is a statement the session made."""
+        assert client.available_mode_ids is None
+        assert client.current_mode_id is None
+
+    def test_a_session_response_carrying_no_modes_reports_none(self, client):
+        client.initialize()
+        client.session_new()
+        client.session_modes = None
+        assert client.available_mode_ids is None
+
+    def test_a_session_that_advertises_none_reports_an_empty_list(self, client):
+        """The other side of that distinction: the session DID report its mode
+        state, and the state is "nothing is selectable here"."""
+        client.initialize()
+        client.session_new()
+        client.session_modes = {"currentModeId": "auto", "availableModes": []}
+        assert client.available_mode_ids == []
+        assert client.current_mode_id == "auto"
+
+    def test_the_advertised_modes_are_read_in_the_agents_order(self, client):
+        client.initialize()
+        client.session_new()
+        assert client.available_mode_ids == ["auto", "default", "plan"]
+
+    def test_the_current_mode_is_what_the_agent_derived_on_its_own(self, client):
+        """Before any negotiation this is the adapter's own posture — which is
+        exactly what the ``inherit`` config value needs in order to be
+        statable."""
+        client.initialize()
+        client.session_new()
+        assert client.current_mode_id == "auto"
+
+    def test_set_mode_moves_the_session(self, client):
+        client.initialize()
+        session_id = client.session_new()
+        assert client.set_mode(session_id, "default")["modeId"] == "default"
+
+    def test_a_mode_the_agent_rejects_raises(self, client):
+        client.initialize()
+        session_id = client.session_new()
+        with pytest.raises(AcpError):
+            client.set_mode(session_id, "bypassPermissions")
+
+
 class TestPromptTurn:
     def test_prompt_streams_updates_then_returns_stop_reason(self, client, tmp_path):
         client.initialize()

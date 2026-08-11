@@ -27,6 +27,12 @@ of Hermes' existing approval flow (``tools/approval.py``) instead of being
 denied outright, so a write raises a real prompt on whichever surface the
 session is running on. Deny is still what happens whenever that flow cannot
 produce a human answer.
+
+Packet 5 slice D closes 3A's one deferred item: the turn now splices the
+projector's ``(assistant tool_calls, tool)`` transcript rows into ``messages``
+before the assistant text, the way ``agent/codex_runtime.py`` always has, so
+``agent/curator.py``, external-memory review, background-review snapshots and
+``session_search`` see what the agent *did* and not only what it said.
 """
 
 from __future__ import annotations
@@ -58,9 +64,11 @@ __all__ = [
     "ClaudeAcpModelOption",
     "ClaudeAcpModelSelectionError",
     "ClaudeCodeAuthRequired",
+    "PERSIST_TOOL_CALLS_CONFIG_KEYS",
     "RESEED_MARKER",
     "RUNTIME_LABEL",
     "claude_acp_display_model",
+    "claude_acp_persist_tool_calls",
     "claude_acp_model_identity",
     "claude_acp_model_options",
     "claude_acp_select_model",
@@ -99,6 +107,33 @@ _STDERR_DIAGNOSTIC_LINES = 5
 # routinely emit a whole JSON blob on ONE line, which would then land intact in
 # a Discord/Telegram message. The head of a diagnostic carries the signal.
 _STDERR_DIAGNOSTIC_LINE_CHARS = 500
+
+# ---------------------------------------------------------------------------
+# Tool-activity recording (Packet 5 slice D).
+#
+# Where the profile owner turns off the transcript rows and the activity stamp
+# this runtime writes for Claude Code's tool calls. Deliberately a *kill switch*
+# and not a feature gate: parity with the sibling delegated runtime is the right
+# default (codex has no such flag, and curator / external memory / session
+# search are silently degraded without the rows), and there is no user-visible
+# surface for it to regress. It exists at all because the rows land in a live
+# session DB that a heavy user has already grown to hundreds of megabytes, and a
+# dogfooder is owed a one-line retreat that does not involve editing code.
+# ---------------------------------------------------------------------------
+
+#: Where that switch lives. `config.yaml` only — behavioural settings never get
+#: an env var (AGENTS.md §Adding Configuration), and per-profile by
+#: construction since `config.yaml` is per-`HERMES_HOME`.
+PERSIST_TOOL_CALLS_CONFIG_KEYS = ("model", "claude_code_acp", "persist_tool_calls")
+
+#: Recording is on unless the profile says otherwise.
+_PERSIST_TOOL_CALLS_DEFAULT = True
+
+#: Values that read as "off" when the key is written as a string. YAML already
+#: parses `false`/`no`/`off` into a bool, so this only covers a quoted value —
+#: which is exactly what a hand-edited config produces.
+_FALSEY_CONFIG_STRINGS = frozenset({"false", "no", "off", "0"})
+_TRUTHY_CONFIG_STRINGS = frozenset({"true", "yes", "on", "1"})
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +532,54 @@ def _usage_model_label(agent: Any) -> str:
     return claude_acp_usage_model(agent)
 
 
+def claude_acp_persist_tool_calls() -> bool:
+    """Whether this profile records Claude Code's tool activity in ``state.db``.
+
+    Covers both writes the recording makes — the ``(assistant tool_calls, tool)``
+    transcript pairs and the mid-turn ``last_activity_at`` stamp — because they
+    are one decision ("keep a Hermes-side record of what the adapter did") and
+    splitting them would leave ``persist_tool_calls: false`` still writing to the
+    DB it was set to stop writing to.
+
+    Never raises, and every rejection resolves to :data:`True`: an absent key, an
+    unreadable config and a value that is not a flag all mean "nobody asked for
+    the retreat", and the parity default is what the plan asked for. A value that
+    is not a flag logs one WARNING naming it — a config setting that is silently
+    ignored is how a setting becomes folklore.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        node: Any = load_config()
+        for key in PERSIST_TOOL_CALLS_CONFIG_KEYS:
+            if not isinstance(node, dict):
+                return _PERSIST_TOOL_CALLS_DEFAULT
+            node = node.get(key)
+    except Exception:
+        logger.debug(
+            "reading model.claude_code_acp.persist_tool_calls failed", exc_info=True
+        )
+        return _PERSIST_TOOL_CALLS_DEFAULT
+    if node is None:
+        return _PERSIST_TOOL_CALLS_DEFAULT
+    if isinstance(node, bool):
+        return node
+    if isinstance(node, int):
+        return node != 0
+    if isinstance(node, str):
+        value = node.strip().lower()
+        if value in _FALSEY_CONFIG_STRINGS:
+            return False
+        if value in _TRUTHY_CONFIG_STRINGS:
+            return True
+    logger.warning(
+        "Ignoring model.claude_code_acp.persist_tool_calls %r: expected a "
+        "boolean; recording Claude Code tool activity as usual",
+        node,
+    )
+    return _PERSIST_TOOL_CALLS_DEFAULT
+
+
 def _diagnostics(turn: Any) -> str:
     """Bounded, credential-scrubbed adapter stderr for a failure message.
 
@@ -597,12 +680,23 @@ def _build_recap(messages: List[Dict[str, Any]]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def make_claude_acp_event_bridge(agent) -> Callable[["ProjectedEvent"], None]:
+def make_claude_acp_event_bridge(
+    agent, *, observe_activity: bool = True
+) -> Callable[["ProjectedEvent"], None]:
     """Build the ``event_sink`` that renders projected ACP events.
 
     Returns a callable taking one ``ProjectedEvent``. Every callback invocation
     is guarded: a buggy display surface must not tear down the turn it is
     observing.
+
+    ``observe_activity`` stamps Hermes' activity clock on each completed tool
+    (Packet 5 slice D). This runtime never called ``_touch_activity``, so
+    ``sessions.last_activity_at`` stayed NULL and a ten-minute Claude Code turn
+    looked idle to every stall consumer — the one place the fix belongs is here,
+    mid-turn, because a stamp written at turn end would say nothing about
+    liveness. Off when the profile turned tool-activity recording off
+    (:func:`claude_acp_persist_tool_calls`), so that switch really does mean "no
+    Hermes-side record of the adapter's tool use".
     """
 
     def _fire(name: str, call: Any, *args: Any, **kwargs: Any) -> None:
@@ -627,10 +721,23 @@ def make_claude_acp_event_bridge(agent) -> Callable[["ProjectedEvent"], None]:
             lambda cb: cb(tool.call_id, tool.name, tool.args),
         )
 
+    def _observe(tool: "ToolActivity") -> None:
+        """Advance the session's activity clock. Observation only, never fatal."""
+        touch = getattr(agent, "_touch_activity", None)
+        if touch is None:
+            return
+        try:
+            touch(f"claude code: {tool.name}")
+        except Exception:
+            logger.debug("activity stamp raised on a projected ACP event",
+                         exc_info=True)
+
     def _tool_completed(tool: "ToolActivity") -> None:
         if tool.needs_start:
             # Never seen as a `tool_call`: open the card before closing it.
             _tool_started(tool)
+        if observe_activity:
+            _observe(tool)
         _fire(
             "tool_progress_callback",
             lambda cb: cb(
@@ -653,12 +760,14 @@ def make_claude_acp_event_bridge(agent) -> Callable[["ProjectedEvent"], None]:
             _tool_started(event.tool)
         elif kind == "tool_completed":
             _tool_completed(event.tool)
-        # "tool_updated" (a non-terminal status change), "usage" and
-        # "model_changed" have no live Hermes surface: usage is recorded once
-        # at turn end, Hermes' tool display is a started/completed pair, and
-        # model identity (Packet 4 slice A) is state capture only — the
-        # session/runtime read it straight off the projector's `model_id`
-        # rather than through this sink; see `_capture_model_identity`.
+        # "tool_updated" (a non-terminal status change), "usage",
+        # "model_changed" and "mode_changed" have no live Hermes surface: usage
+        # is recorded once at turn end, Hermes' tool display is a
+        # started/completed pair, and model identity (Packet 4 slice A) and the
+        # permission posture (Packet 5 slice A) are state capture only — the
+        # session/runtime read them straight off the projector's `model_id` /
+        # `mode_id` rather than through this sink; see
+        # `_capture_model_identity` and `ClaudeAcpSession.run_turn`.
 
     return sink
 
@@ -932,21 +1041,26 @@ def _queue_token_counts(agent, canonical: Any, cost_result: Any) -> None:
 
 
 def _get_or_create_session(
-    agent, argv: list[str], cwd: str, additional_directories: list[str]
+    agent,
+    argv: list[str],
+    cwd: str,
+    additional_directories: list[str],
+    permission_mode: str,
 ) -> ClaudeAcpSession:
     """The one live ACP session for this Hermes conversation.
 
-    Recreated only when the adapter argv, the workspace, or the negotiated
-    workspace roots changed — each means the existing adapter is no longer the
-    right process to be talking to (the roots go out on ``session/new``, so a
-    live adapter cannot be re-scoped in place), and leaving it running would
-    break the one-adapter-per-session invariant.
+    Recreated only when the adapter argv, the workspace, the negotiated
+    workspace roots or the configured permission mode changed — each means the
+    existing adapter is no longer the right process to be talking to (the roots
+    and the mode are both negotiated per session, so a live adapter cannot be
+    re-scoped or re-posted in place), and leaving it running would break the
+    one-adapter-per-session invariant.
     """
     session = getattr(agent, "_claude_acp_session", None)
     if (
         session is not None
         and not session.closed
-        and session.matches(argv, cwd, additional_directories)
+        and session.matches(argv, cwd, additional_directories, permission_mode)
     ):
         return session
     if session is not None:
@@ -958,6 +1072,7 @@ def _get_or_create_session(
         argv=argv,
         cwd=cwd,
         additional_directories=additional_directories,
+        permission_mode=permission_mode,
         store=BindingStore.for_agent(agent),
         # A persistence-isolated fork shares the parent's session_id, so
         # keying the registry on it would retire the user's live adapter out
@@ -999,11 +1114,24 @@ def run_claude_code_acp_turn(
 
     # Workspace containment is negotiated at session creation, never inferred:
     # the cwd, plus only the directories the user explicitly allowed in
-    # config.yaml. See agent/claude_acp_workspace.py.
+    # config.yaml. See agent/claude_acp_workspace.py. The permission posture is
+    # negotiated on the same call and read from the same file — one config
+    # decision per profile, never an env var. See
+    # agent/claude_acp_permissions.py.
+    from agent.claude_acp_permissions import configured_permission_mode
     from agent.claude_acp_workspace import resolve_additional_directories
 
+    # Read once per turn: it decides both the transcript splice below and the
+    # activity stamp inside the event bridge, and a config read per projected
+    # event would be a file stat per tool call.
+    record_tool_activity = claude_acp_persist_tool_calls()
+
     session = _get_or_create_session(
-        agent, argv, cwd, resolve_additional_directories(cwd)
+        agent,
+        argv,
+        cwd,
+        resolve_additional_directories(cwd),
+        configured_permission_mode(),
     )
 
     try:
@@ -1017,7 +1145,9 @@ def run_claude_code_acp_turn(
             # latched flag into the turn so the cancel goes out as soon as a
             # session exists.
             cancel_pending=bool(getattr(agent, "_interrupt_requested", False)),
-            event_sink=make_claude_acp_event_bridge(agent),
+            event_sink=make_claude_acp_event_bridge(
+                agent, observe_activity=record_tool_activity,
+            ),
             # Replaces Packet 1's blanket denial. Absent this handler the
             # session still denies every request, so the fail-closed default
             # survives any future caller that forgets to pass it.
@@ -1106,10 +1236,28 @@ def run_claude_code_acp_turn(
     if outcome.reseeded:
         final_text = f"{RESEED_MARKER}\n\n{final_text}" if final_text else RESEED_MARKER
 
-    # The inbound user message was already appended by run_conversation()
-    # before the early return, so only the reply is added here.
+    # The inbound user message was already appended by run_conversation() before
+    # the early return, so what this turn adds is its tool activity followed by
+    # the reply: `user` → `[assistant(tool_calls), tool]*` → `assistant(text)`.
+    # That order is what keeps role alternation intact (no two adjacent rows
+    # share a role) and it is the shape `agent/codex_runtime.py` has shipped
+    # since the codex runtime landed.
+    #
+    # Nothing here reaches Claude Code. This runtime never replays `messages`
+    # into the adapter — Hermes sends the new turn only — so the rows are
+    # Hermes-side records and the adapter's prompt cache is untouched. The one
+    # thing that ever goes back is the reseed recap, and `_build_recap` filters
+    # to string-content user/assistant rows, which excludes both the tool rows
+    # and the `content=None` assistant rows carrying `tool_calls`.
+    tool_rows = list(outcome.projected_messages) if record_tool_activity else []
+    if tool_rows:
+        messages.extend(tool_rows)
     if final_text:
         messages.append({"role": "assistant", "content": final_text})
+    if tool_rows or final_text:
+        # One flush for the whole turn. `_flush_messages_to_session_db` is
+        # marker-idempotent, so the user row this turn already wrote is not
+        # rewritten (#860/#42039).
         _persist(agent, messages)
 
     # A fork lives for exactly one turn, so its adapter is per-turn state:

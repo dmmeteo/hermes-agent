@@ -1680,41 +1680,26 @@ class GatewaySlashCommandsMixin:
     def _display_model_for(agent) -> str:
         """What to show as *agent*'s model on a gateway surface.
 
-        For the Claude Code ACP runtime ``agent.model`` is a static
-        pseudo-model (``"claude-code"``) that deliberately never changes — the
-        live model is a separately captured identity (see
-        ``agent/claude_code_runtime.py``). Every other provider is unaffected:
-        the seam answers ``None`` unless a Claude Code identity was captured.
-        Guarded, because a display must never be what breaks a command.
+        The commands' spelling of ``gateway.model_identity.display_model_for``,
+        which the runtime footer also reads — one implementation, so a footer
+        and a ``/usage`` in the same session cannot report different models
+        (Packet 5 slice B).
         """
-        try:
-            from agent.claude_code_runtime import claude_acp_display_model
+        from gateway.model_identity import display_model_for
 
-            label = claude_acp_display_model(agent)
-        except Exception:
-            label = None
-        return label or str(getattr(agent, "model", "") or "")
+        return display_model_for(agent)
 
     @staticmethod
     def _metadata_model_for(agent) -> str:
         """The model string to look model *metadata* up with (context window).
 
-        The display label is the wrong key for that — the metadata tables are
-        keyed on ids — so this asks the runtime for its accounting id, which
-        falls back to the pseudo-model when ACP reported only a picker
-        selector. See ``claude_acp_usage_model``.
+        The commands' spelling of ``gateway.model_identity.metadata_model_for``
+        — deliberately a different answer from ``_display_model_for``, because
+        a label is shown and an id is looked up.
         """
-        try:
-            from agent.claude_code_runtime import (
-                claude_acp_model_identity,
-                claude_acp_usage_model,
-            )
+        from gateway.model_identity import metadata_model_for
 
-            if claude_acp_model_identity(agent) is not None:
-                return claude_acp_usage_model(agent)
-        except Exception:
-            pass
-        return str(getattr(agent, "model", "") or "")
+        return metadata_model_for(agent)
 
     def _resident_agent_for_session(self, session_key: str):
         """The agent already serving *session_key*, or ``None``.

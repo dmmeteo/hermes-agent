@@ -389,15 +389,56 @@ class TestUsageProjection:
             agent.close()
         assert seen == []
 
+    def test_a_quiet_turn_keeps_the_occupancy_the_session_last_reported(
+        self, tmp_path, monkeypatch
+    ):
+        """`usage_update` arrives on a per-turn projector, so a turn that emits
+        none used to report no occupancy at all — and any display of it (the
+        gateway runtime footer, Packet 5 slice B) flickered between a real
+        percentage and none, turn by turn. How full the window is, is a
+        standing fact about the *session*: the adapter's last statement about
+        it stands until the adapter makes another."""
+        agent = _agent_with(tmp_path, "usage-once", monkeypatch)
+        try:
+            loud = agent.run_conversation("first")
+            quiet = agent.run_conversation("second")
+        finally:
+            agent.close()
+        assert loud["context_used_tokens"] == fake.CONTEXT_USED_TOKENS
+        assert quiet["context_used_tokens"] == fake.CONTEXT_USED_TOKENS
+        assert quiet["context_window_tokens"] == fake.CONTEXT_WINDOW_TOKENS
+
+    def test_a_carried_over_occupancy_carries_no_cost(self, tmp_path, monkeypatch):
+        """Occupancy is a standing fact; a cost is an event. The adapter's
+        figure is what one turn would have cost on API billing, so re-reporting
+        it for a turn that reported none would invent spend that never
+        happened."""
+        agent = _agent_with(tmp_path, "usage-once", monkeypatch)
+        try:
+            loud = agent.run_conversation("first")
+            quiet = agent.run_conversation("second")
+        finally:
+            agent.close()
+        assert loud["adapter_reported_cost_usd"] == fake.TURN_COST_USD
+        assert "adapter_reported_cost_usd" not in quiet
+
 
 class TestInvariantsPreserved:
     """Cross-cutting invariants must survive the new projection."""
 
     def test_role_alternation_holds(self, tool_turn):
+        """Since Packet 5 slice D a tool-using turn splices its tool activity
+        between the user row and the reply (``user`` →
+        ``[assistant(tool_calls), tool]*`` → ``assistant(text)``), the shape
+        ``agent/codex_runtime.py`` has always produced. What must hold is the
+        invariant, not the old row count: no two adjacent rows share a role, and
+        the turn still ends on the assistant's answer."""
         _, _, result = tool_turn
         roles = [m["role"] for m in result["messages"]]
-        assert roles == ["user", "assistant"]
+        assert roles[0] == "user"
+        assert roles[-1] == "assistant"
         assert all(a != b for a, b in zip(roles, roles[1:]))
+        assert roles.count("tool") == 4
 
     def test_only_the_new_user_turn_is_sent(self, tmp_path, monkeypatch):
         """Prompt caching is sacred: projection must not start replaying

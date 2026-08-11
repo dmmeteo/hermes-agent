@@ -97,6 +97,12 @@ Env vars:
                       ``user_message_chunk``, ``agent_thought_chunk``,
                       ``plan``, ``available_commands_update``,
                       ``usage_update``, and a ``usage`` block on the reply
+    ``cancel-mid-tool``
+                      open a ``tool_call`` and never report its outcome, then
+                      block until cancelled and answer ``cancelled`` — the one
+                      shape that leaves a tool call with no terminal update, and
+                      therefore the shape that decides whether a transcript ends
+                      up with an orphan ``tool_calls`` row (Packet 5 slice D)
     ``partial-tag``   answer with text whose last character could start a
                       ``<think>`` tag, so the streaming scrubber holds it back
                       until the turn is flushed
@@ -108,6 +114,17 @@ Env vars:
                       SDK-side refusal fallback (``syncModelAfterRefusalFallback``
                       in ``dist/acp-agent.js``), which is unprompted and carries
                       no separate "fallback happened" event of its own
+    ``mode-switch``   like ``normal``, but emits a ``current_mode_update``
+                      part-way through the turn moving the session's permission
+                      mode to ``FAKE_ACP_SWITCH_MODE`` — the notification a real
+                      adapter sends when the mode changes out from under the
+                      client (Packet 5 slice A)
+    ``usage-once``    report context occupancy on the session's FIRST turn and
+                      never again. A real adapter emits ``usage_update`` when it
+                      has something to say, not on a schedule, so a quiet turn
+                      (no tool use, nothing that moves the window) carries none
+                      — the shape that makes an occupancy display flicker
+                      (Packet 5 slice B)
 
 ``FAKE_ACP_MODEL_ID`` / ``FAKE_ACP_FALLBACK_MODEL_ID`` (Packet 4 slice A):
 override the model id ``session/new`` / ``session/load`` report (and, in
@@ -125,6 +142,28 @@ the comma-separated model ids this session advertises as *selectable* (the
 ``FAKE_ACP_LOAD_NO_CONFIG_OPTIONS`` (Packet 4): answer ``session/load`` with no
 ``configOptions`` key at all, so a test can rebind against an adapter build
 that reports its session config only on ``session/new``.
+
+``FAKE_ACP_HUGE_TOOL_OUTPUT`` (Packet 5 slice D): how many filler characters the
+``tools`` turn's first tool reports as its output. A persisted tool row is
+bounded, so the only way to prove the bound *and* its truncation marker is a
+result that genuinely exceeds it.
+
+The record also carries ``skills_dir_listings`` (Packet 5 slice C): one entry per
+``session/new`` / ``session/load``, listing this child's own
+``<CLAUDE_CONFIG_DIR or $HOME/.claude>/skills`` **at that moment**. The real
+adapter builds its SDK query and awaits ``initializationResult()`` inside those
+two calls, so a link written after one of them is invisible for the life of that
+session — recording the listing there is what makes an ordering assertion
+possible at all.
+
+``FAKE_ACP_MODES`` / ``FAKE_ACP_NO_MODES`` / ``FAKE_ACP_CURRENT_MODE`` /
+``FAKE_ACP_REJECT_SET_MODE`` (Packet 5 slice A): the permission modes
+``session/new`` and ``session/load`` advertise (``modes.availableModes``), the
+mode they report as current before the client negotiates anything
+(``modes.currentModeId``, defaulting to the real adapter's self-approving
+``auto``), a switch that omits the ``modes`` key entirely — the older-adapter
+case a client must not read as "inherit whatever is there" — and a switch that
+makes every ``session/set_mode`` fail.
 """
 
 from __future__ import annotations
@@ -186,6 +225,37 @@ _REJECT_SET_CONFIG = os.getenv("FAKE_ACP_REJECT_SET_CONFIG", "") == "1"
 #: "this response carries no model state", the other "the model state is empty",
 #: and a rebind must not treat either as "keep whatever the last adapter said".
 _LOAD_NO_CONFIG_OPTIONS = os.getenv("FAKE_ACP_LOAD_NO_CONFIG_OPTIONS", "") == "1"
+#: Packet 5 slice A: the permission modes this session advertises, in the
+#: adapter's own order. The real 0.66.0 adapter answers `session/new` with
+#: `modes: {currentModeId, availableModes}` alongside `configOptions`.
+_MODES = [
+    value.strip()
+    for value in os.getenv(
+        "FAKE_ACP_MODES",
+        "auto,default,acceptEdits,plan,dontAsk,bypassPermissions",
+    ).split(",")
+    if value.strip()
+]
+_MODE_NAMES = {
+    "auto": "Auto",
+    "default": "Default",
+    "acceptEdits": "Accept edits",
+    "plan": "Plan",
+    "dontAsk": "Don't ask",
+    "bypassPermissions": "Bypass permissions",
+}
+#: Omit the ``modes`` key from every session response — an adapter build that
+#: reports no mode state at all. Distinct from advertising an empty list, and a
+#: client must not read either as "leave the mode alone".
+_NO_MODES = os.getenv("FAKE_ACP_NO_MODES", "") == "1"
+#: The mode this session is in before the client negotiates anything. The real
+#: adapter's own default is the self-approving `auto`, which is exactly why
+#: Hermes negotiates a mode at all.
+_current_mode_id = os.getenv("FAKE_ACP_CURRENT_MODE", "auto")
+#: Fail every ``session/set_mode`` — an adapter that refuses the negotiation.
+_REJECT_SET_MODE = os.getenv("FAKE_ACP_REJECT_SET_MODE", "") == "1"
+#: The mode the ``mode-switch`` turn moves to mid-turn.
+_SWITCH_MODE = os.getenv("FAKE_ACP_SWITCH_MODE", "plan")
 _RECORD_PATH = os.getenv("FAKE_ACP_RECORD", "")
 _RECORD_DIR = os.getenv("FAKE_ACP_RECORD_DIR", "")
 _STORE_DIR = os.getenv("FAKE_ACP_STORE", "")
@@ -244,6 +314,14 @@ _record: dict = {
     # Replies to the agent-initiated requests this adapter sent, so a test can
     # assert HOW the client refused rather than only that the turn survived.
     "client_request_replies": [],
+    # Packet 5 slice C evidence. One entry per session/new and session/load,
+    # dumped from inside the adapter AT THAT MOMENT. The real adapter builds its
+    # SDK query and awaits initializationResult() inside those two calls, so the
+    # personal-skill scan happens exactly then — a link written afterwards is
+    # invisible for the life of that session. Recording the listing here is what
+    # makes the E2E an assertion about ORDERING rather than about files merely
+    # existing somewhere by the end of the turn.
+    "skills_dir_listings": [],
 }
 _record_lock = threading.Lock()
 
@@ -352,6 +430,19 @@ TURN_COST_USD = 0.42
 # this file must never come into existence.
 REPORTED_LOCATION = "reported-but-absent.txt"
 
+# Filler for the oversized tool result (``FAKE_ACP_HUGE_TOOL_OUTPUT``). One
+# repeated character so a test can assert on the truncated length and the
+# marker without the payload's own structure getting in the way.
+HUGE_OUTPUT_FILLER = "z"
+_HUGE_TOOL_OUTPUT_CHARS = 0
+try:
+    _HUGE_TOOL_OUTPUT_CHARS = int(os.getenv("FAKE_ACP_HUGE_TOOL_OUTPUT", "0") or 0)
+except ValueError:
+    _HUGE_TOOL_OUTPUT_CHARS = 0
+
+# The tool call ``cancel-mid-tool`` opens and never finishes.
+UNFINISHED_TOOL_CALL_ID = "tc-unfinished"
+
 
 def _handle_typed_events(session_id: str, msg: dict) -> None:
     """Emit the typed session/update zoo, then finish the turn."""
@@ -374,11 +465,16 @@ def _handle_typed_events(session_id: str, msg: dict) -> None:
     })
     _update(session_id, {"sessionUpdate": "tool_call_update",
                          "toolCallId": "tc-read", "status": "in_progress"})
+    read_output = f"42 (token {TOOL_OUTPUT_SECRET})"
+    if _HUGE_TOOL_OUTPUT_CHARS > 0:
+        # A whole file's worth of output. What lands in a transcript row has to
+        # be bounded; what the display bubble showed already was.
+        read_output = HUGE_OUTPUT_FILLER * _HUGE_TOOL_OUTPUT_CHARS
     _update(session_id, {
         "sessionUpdate": "tool_call_update",
         "toolCallId": "tc-read",
         "status": "completed",
-        "rawOutput": {"content": f"42 (token {TOOL_OUTPUT_SECRET})"},
+        "rawOutput": {"content": read_output},
     })
     # A tool that fails: the display must say so rather than reporting success.
     _update(session_id, {
@@ -626,6 +722,37 @@ def _model_config_options(model_id: str = "") -> list:
     ]
 
 
+def _session_modes() -> dict:
+    """The ``modes`` block ``session/new`` / ``session/load`` carry.
+
+    Real shape (``createSession`` in ``dist/acp-agent.js``):
+    ``{currentModeId, availableModes: [{id, name}, …]}``. The current id moves
+    when the client negotiates one with ``session/set_mode``.
+    """
+    return {
+        "currentModeId": _current_mode_id,
+        "availableModes": [
+            {"id": mode, "name": _MODE_NAMES.get(mode, mode)} for mode in _MODES
+        ],
+    }
+
+
+def _handle_set_mode(msg: dict) -> None:
+    """Answer ``session/set_mode``: record it, then honour or refuse it."""
+    global _current_mode_id
+    mode_id = (msg.get("params") or {}).get("modeId")
+    with _record_lock:
+        _record["set_mode_calls"].append(mode_id)
+    _flush_record()
+    if _REJECT_SET_MODE:
+        _send({"jsonrpc": "2.0", "id": msg["id"], "error": {
+            "code": -32603, "message": f"Cannot set mode: {mode_id}",
+        }})
+        return
+    _current_mode_id = mode_id
+    _send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+
+
 def _handle_set_config_option(msg: dict) -> None:
     """Answer ``session/set_config_option`` the way adapter 0.66.0 does.
 
@@ -680,8 +807,47 @@ def _new_session_id() -> str:
     return session_id
 
 
+def _record_skills_dir(call: str) -> None:
+    """Dump this child's own personal-skill directory, as it looks right now.
+
+    Resolved the way the pinned SDK resolves it —
+    ``process.env.CLAUDE_CONFIG_DIR ?? homedir()/.claude`` — so the path the
+    test asserts about is the path the real adapter would read. ``usable`` is
+    the subset the child can actually load through: a link that lists but whose
+    ``SKILL.md`` cannot be read is a skill the model would fail on.
+    """
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
+        os.environ.get("HOME", ""), ".claude"
+    )
+    skills_dir = os.path.join(config_dir, "skills")
+    try:
+        entries = sorted(
+            name for name in os.listdir(skills_dir) if not name.startswith(".")
+        )
+    except OSError:
+        entries = []
+    usable = []
+    for name in entries:
+        try:
+            with open(os.path.join(skills_dir, name, "SKILL.md"), "rb") as handle:
+                handle.read(1)
+            usable.append(name)
+        except OSError:
+            pass
+    with _record_lock:
+        _record["skills_dir_listings"].append({
+            "call": call,
+            "home": os.environ.get("HOME", ""),
+            "dir": skills_dir,
+            "entries": entries,
+            "usable": usable,
+        })
+    _flush_record()
+
+
 def _handle_load(msg: dict) -> None:
     """Rebind an existing session, replaying its history first."""
+    _record_skills_dir("session/load")
     params = msg.get("params") or {}
     session_id = params.get("sessionId") or ""
     with _record_lock:
@@ -710,6 +876,8 @@ def _handle_load(msg: dict) -> None:
     load_result: dict = {}
     if not _LOAD_NO_CONFIG_OPTIONS:
         load_result["configOptions"] = _model_config_options()
+    if not _NO_MODES:
+        load_result["modes"] = _session_modes()
     _send({"jsonrpc": "2.0", "id": msg["id"], "result": load_result})
     if _MODE == "load-replays-late":
         # The nastier shape of the same hazard: a replay notification emitted
@@ -804,6 +972,27 @@ def _handle_prompt(msg: dict) -> None:
         _send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "cancelled"}})
         return
 
+    if _MODE == "cancel-mid-tool":
+        # A tool that is still running when the user stops the turn. The adapter
+        # never sends a terminal `tool_call_update` for it — there was no
+        # outcome — so the client is left holding an opened call that never
+        # closed. That is the only shape that can leave an assistant
+        # `tool_calls` row with no matching tool result behind it.
+        _text(session_id, "starting the search ")
+        _update(session_id, {
+            "sessionUpdate": "tool_call",
+            "toolCallId": UNFINISHED_TOOL_CALL_ID,
+            "title": "Grep the whole tree",
+            "kind": "search",
+            "status": "in_progress",
+            "rawInput": {"pattern": "TODO", "token": TOOL_INPUT_SECRET},
+            "_meta": {"claudeCode": {"toolName": "Grep"}},
+        })
+        while not _cancelled.wait(timeout=0.05):
+            pass
+        _send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "cancelled"}})
+        return
+
     if _MODE == "cancel-empty":
         # Interrupted before the model emitted anything — no text at all.
         while not _cancelled.wait(timeout=0.05):
@@ -843,6 +1032,38 @@ def _handle_prompt(msg: dict) -> None:
         })
         _text(session_id, "Falling back now.")
         _send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}})
+        return
+
+    if _MODE == "mode-switch":
+        # The session's permission mode moved mid-turn. ACP announces this as
+        # its own notification kind (unlike a model change, which rides
+        # config_option_update), and it carries no display meaning at all.
+        global _current_mode_id
+        _text(session_id, "Switching mode. ")
+        _current_mode_id = _SWITCH_MODE
+        _update(session_id, {
+            "sessionUpdate": "current_mode_update",
+            "currentModeId": _SWITCH_MODE,
+        })
+        _text(session_id, "Switched.")
+        _send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}})
+        return
+
+    if _MODE == "usage-once":
+        # Occupancy is a standing fact about the session's window, and the
+        # adapter states it only when it changes. The second turn here is the
+        # quiet one: same session, same window, no `usage_update`.
+        with _record_lock:
+            first_turn = len(_record["prompts"]) == 1
+        if first_turn:
+            _update(session_id, {"sessionUpdate": "usage_update",
+                                 "used": CONTEXT_USED_TOKENS,
+                                 "size": CONTEXT_WINDOW_TOKENS,
+                                 "cost": {"amount": TURN_COST_USD,
+                                          "currency": "USD"}})
+        _text(session_id, "Loud." if first_turn else "Quiet.")
+        _send({"jsonrpc": "2.0", "id": msg["id"],
+               "result": {"stopReason": "end_turn", "usage": dict(TURN_USAGE)}})
         return
 
     if _MODE == "grandchild":
@@ -926,6 +1147,7 @@ def main() -> None:
         elif method == "session/load":
             _handle_load(msg)
         elif method == "session/new":
+            _record_skills_dir("session/new")
             if _MODE == "auth-required":
                 _send({"jsonrpc": "2.0", "id": msg["id"], "error": {
                     "code": -32000, "message": "Authentication required",
@@ -947,17 +1169,17 @@ def main() -> None:
                 continue
             with _record_lock:
                 _record["session_new_params"].append(msg.get("params") or {})
-            _send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+            new_result: dict = {
                 "sessionId": _new_session_id(),
                 "configOptions": _model_config_options(),
-            }})
+            }
+            if not _NO_MODES:
+                new_result["modes"] = _session_modes()
+            _send({"jsonrpc": "2.0", "id": msg["id"], "result": new_result})
         elif method == "session/set_config_option":
             _handle_set_config_option(msg)
         elif method == "session/set_mode":
-            with _record_lock:
-                _record["set_mode_calls"].append((msg.get("params") or {}).get("modeId"))
-            _flush_record()
-            _send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+            _handle_set_mode(msg)
         elif method == "session/prompt":
             threading.Thread(target=_handle_prompt, args=(msg,), daemon=True).start()
         else:

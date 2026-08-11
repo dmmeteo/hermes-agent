@@ -14,13 +14,26 @@ tests; the wire capture and end-to-end runtime behaviour are covered in
 Slice B adds the *selectable* half of the same option: ``extract_model_options``
 reads the "model" entry's ``options`` list — the models this live session
 actually advertises, which is the only truthful source for a Hermes-side pick.
+
+Packet 5 slice D adds ``projected_messages``: the same terminal tool events the
+display surfaces see, as canonical ``(assistant tool_calls, tool)`` transcript
+pairs. ``TestTranscriptProjection`` covers the shape, the bounds and the
+orphan-repair rule as pure data; the end-to-end persistence is
+``tests/agent/test_claude_code_transcript_projection.py``.
 """
 
 from __future__ import annotations
 
+import json
+
 from agent.transports.claude_acp_event_projector import (
+    PERSISTED_RESULT_MAX_CHARS,
+    UNREPORTED_TOOL_RESULT,
     ClaudeAcpEventProjector,
     ProjectedEvent,
+    deterministic_call_id,
+    extract_available_mode_ids,
+    extract_current_mode_id,
     extract_current_model_id,
     extract_model_options,
     has_model_config_option,
@@ -262,3 +275,313 @@ class TestHasModelConfigOption:
     def test_false_for_a_response_with_no_config_options_at_all(self):
         assert has_model_config_option(None) is False
         assert has_model_config_option([]) is False
+
+
+class TestTranscriptProjection:
+    """Packet 5 slice D: terminal tool events as canonical transcript rows.
+
+    The shape is ``agent/transports/codex_event_projector.py``'s, verbatim —
+    ``{role: assistant, content: None, tool_calls: [...]}`` followed by
+    ``{role: tool, tool_call_id, content}`` — because that is what
+    ``agent/curator.py``, ``session_search`` and a later native-model turn
+    already know how to read.
+    """
+
+    def _call(self, **overrides):
+        payload = {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-1",
+            "title": "Read notes.txt",
+            "kind": "read",
+            "status": "pending",
+            "rawInput": {"file_path": "notes.txt"},
+            "_meta": {"claudeCode": {"toolName": "Read"}},
+        }
+        payload.update(overrides)
+        return payload
+
+    def _done(self, **overrides):
+        payload = {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc-1",
+            "status": "completed",
+            "rawOutput": "42",
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_a_fresh_projector_has_projected_nothing(self):
+        assert ClaudeAcpEventProjector().projected_messages == []
+
+    def test_a_completed_tool_projects_one_assistant_tool_row_and_one_result(self):
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call())
+        projector.project(self._done())
+        assert projector.projected_messages == [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": deterministic_call_id("tc-1"),
+                    "type": "function",
+                    "function": {
+                        "name": "Read",
+                        "arguments": json.dumps(
+                            {"file_path": "notes.txt"}, ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": deterministic_call_id("tc-1"),
+                "name": "Read",
+                "tool_name": "Read",
+                "content": "42",
+            },
+        ]
+
+    def test_progress_updates_add_no_rows_of_their_own(self):
+        """Rows are written per *outcome*, not per progress event — otherwise a
+        long-running tool writes a row every time its status changes."""
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call())
+        for _ in range(3):
+            projector.project(self._done(status="in_progress", rawOutput=None))
+        assert len(projector.projected_messages) == 2
+        projector.project(self._done())
+        assert len(projector.projected_messages) == 2
+
+    def test_a_tool_that_arrives_already_completed_projects_one_pair(self):
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call(status="completed", rawOutput="2 entries"))
+        rows = projector.projected_messages
+        assert [row["role"] for row in rows] == ["assistant", "tool"]
+        assert rows[1]["content"] == "2 entries"
+
+    def test_an_update_only_tool_projects_one_pair(self):
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._done(
+            toolCallId="tc-orphan", title="Grep", kind="search",
+            rawInput={"pattern": "TODO"}, rawOutput="3 matches",
+            _meta={"claudeCode": {"toolName": "Grep"}},
+        ))
+        rows = projector.projected_messages
+        assert [row["role"] for row in rows] == ["assistant", "tool"]
+        assert rows[1]["tool_name"] == "Grep"
+
+    def test_two_tools_project_two_pairs_in_completion_order(self):
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call())
+        projector.project(self._call(
+            toolCallId="tc-2", _meta={"claudeCode": {"toolName": "Bash"}},
+            rawInput={"command": "ls"},
+        ))
+        projector.project(self._done(toolCallId="tc-2", rawOutput="ok"))
+        projector.project(self._done())
+        assert [
+            row["tool_name"] for row in projector.projected_messages
+            if row["role"] == "tool"
+        ] == ["Bash", "Read"]
+
+    def test_a_failed_tool_is_marked_in_the_row(self):
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call())
+        projector.project(self._done(status="failed", rawOutput="boom"))
+        rows = projector.projected_messages
+        assert rows[1]["content"] == "[failed] boom"
+
+    def test_a_failed_tool_with_no_output_still_reports_the_failure(self):
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call())
+        projector.project(self._done(status="failed", rawOutput=None))
+        assert projector.projected_messages[1]["content"] == "[failed]"
+
+    def test_an_unfinished_tool_is_repaired_rather_than_left_orphaned(self):
+        """An assistant row carrying ``tool_calls`` with no matching ``tool``
+        row breaks ``repair_message_sequence`` and would break a later
+        native-model turn on the same session. A turn that ends mid-tool
+        (cancel, error, a stop reason that is not ``end_turn``) is exactly how
+        one would be produced."""
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call())
+        rows = projector.projected_messages
+        assert [row["role"] for row in rows] == ["assistant", "tool"]
+        assert rows[1]["content"] == UNREPORTED_TOOL_RESULT
+        assert rows[1]["tool_call_id"] == rows[0]["tool_calls"][0]["id"]
+
+    def test_repair_covers_a_tool_left_in_progress(self):
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call())
+        projector.project(self._done(status="in_progress", rawOutput=None))
+        rows = projector.projected_messages
+        assert rows[1]["content"] == UNREPORTED_TOOL_RESULT
+
+    def test_a_finished_tool_is_never_repaired_on_top_of_its_own_result(self):
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call())
+        projector.project(self._done())
+        assert len(projector.projected_messages) == 2
+
+    def test_a_second_terminal_update_does_not_duplicate_the_pair(self):
+        """Two rows under one ``tool_call_id`` would break the pairing that
+        ``repair_message_sequence`` — and a later native-model turn — relies on.
+        First outcome wins; the display's own handling of a second completion is
+        unchanged."""
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call())
+        projector.project(self._done(rawOutput="first"))
+        event = projector.project(self._done(status="failed", rawOutput="second"))
+        rows = projector.projected_messages
+        assert len(rows) == 2
+        assert rows[1]["content"] == "first"
+        assert event.kind == "tool_completed"
+
+    def test_reading_the_messages_twice_returns_the_same_rows(self):
+        """Read at turn end, and possibly read again by a caller inspecting the
+        outcome. Repair must not accumulate."""
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call())
+        projector.project(self._call(
+            toolCallId="tc-2", _meta={"claudeCode": {"toolName": "Bash"}},
+        ))
+        projector.project(self._done(toolCallId="tc-2", rawOutput="ok"))
+        assert projector.projected_messages == projector.projected_messages
+        assert len(projector.projected_messages) == 4
+
+    def test_the_returned_list_cannot_be_mutated_into_the_projector(self):
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call())
+        projector.project(self._done())
+        projector.projected_messages.append({"role": "user", "content": "nope"})
+        assert len(projector.projected_messages) == 2
+
+    def test_arguments_are_scrubbed_before_they_reach_a_row(self):
+        secret = "sk-ant-api03-NOTAREALSECRET0123456789"
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call(rawInput={"file_path": "a.py", "key": secret}))
+        projector.project(self._done())
+        arguments = projector.projected_messages[0]["tool_calls"][0]["function"][
+            "arguments"
+        ]
+        assert secret not in arguments
+        assert json.loads(arguments)["file_path"] == "a.py"
+
+    def test_a_result_is_scrubbed_before_it_reaches_a_row(self):
+        secret = "ghp_NOTAREALOUTPUTSECRET0123456789"
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call())
+        projector.project(self._done(rawOutput=f"token {secret}"))
+        assert secret not in projector.projected_messages[1]["content"]
+
+    def test_an_oversized_result_is_truncated_with_a_counted_marker(self):
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call())
+        projector.project(
+            self._done(rawOutput="z" * (PERSISTED_RESULT_MAX_CHARS + 1234))
+        )
+        content = projector.projected_messages[1]["content"]
+        assert content.startswith("z" * 100)
+        assert content.endswith("… [+1234 chars truncated]")
+        assert content.count("z") == PERSISTED_RESULT_MAX_CHARS
+
+    def test_a_result_at_the_bound_is_not_marked(self):
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call())
+        projector.project(self._done(rawOutput="z" * PERSISTED_RESULT_MAX_CHARS))
+        assert projector.projected_messages[1]["content"] == (
+            "z" * PERSISTED_RESULT_MAX_CHARS
+        )
+
+    def test_the_persisted_result_is_bounded_independently_of_the_display_one(
+        self,
+    ):
+        """The display bubble's bound cuts with a bare ellipsis, which carries
+        no count. Deriving the row from it would lose the one thing a
+        transcript reader needs to know."""
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call())
+        event = projector.project(
+            self._done(rawOutput="z" * (PERSISTED_RESULT_MAX_CHARS + 10))
+        )
+        assert event.tool.result.endswith("…")
+        assert "chars truncated" not in event.tool.result
+        assert projector.projected_messages[1]["content"].endswith(
+            "chars truncated]"
+        )
+
+    def test_a_diff_or_terminal_content_block_reaches_the_row(self):
+        """``rawOutput`` is optional; the ``content`` blocks are what an edit
+        reports, and a transcript with no record of an edit is the gap this
+        closes."""
+        projector = ClaudeAcpEventProjector()
+        projector.project(self._call(
+            _meta={"claudeCode": {"toolName": "Edit"}}, kind="edit",
+        ))
+        projector.project(self._done(rawOutput=None, content=[
+            {"type": "diff", "path": "a.py"},
+        ]))
+        assert projector.projected_messages[1]["content"] == "[diff] a.py"
+
+    def test_text_and_usage_events_project_no_rows(self):
+        projector = ClaudeAcpEventProjector()
+        projector.project({"sessionUpdate": "agent_message_chunk",
+                           "content": {"type": "text", "text": "hello"}})
+        projector.project({"sessionUpdate": "agent_thought_chunk",
+                           "content": {"type": "text", "text": "thinking"}})
+        projector.project({"sessionUpdate": "usage_update", "used": 5, "size": 10})
+        projector.project({"sessionUpdate": "user_message_chunk",
+                           "content": {"type": "text", "text": "echo"}})
+        assert projector.projected_messages == []
+
+    def test_the_row_count_tracks_the_tool_iteration_count(self):
+        """One pair per completed tool call, which is the same event the skill
+        nudge counts — so the two can never disagree about how many tools ran."""
+        projector = ClaudeAcpEventProjector()
+        for index in range(3):
+            projector.project(self._call(toolCallId=f"tc-{index}"))
+            projector.project(self._done(toolCallId=f"tc-{index}"))
+        assert projector.tool_iterations == 3
+        assert len(projector.projected_messages) == 6
+
+
+class TestExtractModeState:
+    """Packet 5 slice A: the ``modes`` block on a session response.
+
+    A first-class ACP field, unlike the model — so this reads
+    ``{currentModeId, availableModes}`` and nothing else. It reports; the
+    policy in ``agent/claude_acp_permissions.py`` decides.
+    """
+
+    def test_reads_the_current_mode(self):
+        assert extract_current_mode_id(
+            {"currentModeId": "acceptEdits", "availableModes": []}
+        ) == "acceptEdits"
+
+    def test_a_blank_or_absent_current_mode_is_none(self):
+        assert extract_current_mode_id({"availableModes": []}) is None
+        assert extract_current_mode_id({"currentModeId": "  "}) is None
+        assert extract_current_mode_id({"currentModeId": 7}) is None
+        assert extract_current_mode_id(None) is None
+
+    def test_reads_the_advertised_ids_in_order(self):
+        assert extract_available_mode_ids({"availableModes": [
+            {"id": "auto", "name": "Auto"},
+            {"id": "default", "name": "Default"},
+        ]}) == ["auto", "default"]
+
+    def test_a_repeated_id_is_reported_once(self):
+        assert extract_available_mode_ids({"availableModes": [
+            {"id": "auto"}, {"id": "auto"},
+        ]}) == ["auto"]
+
+    def test_malformed_entries_are_dropped_not_guessed(self):
+        assert extract_available_mode_ids({"availableModes": [
+            {"id": "auto"}, {"name": "no id"}, {"id": ""}, {"id": 3}, None,
+        ]}) == ["auto"]
+
+    def test_a_block_that_advertises_nothing_reads_as_empty(self):
+        assert extract_available_mode_ids({"currentModeId": "auto"}) == []
+        assert extract_available_mode_ids({"availableModes": []}) == []
+        assert extract_available_mode_ids(None) == []

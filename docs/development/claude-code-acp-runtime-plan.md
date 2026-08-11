@@ -17,18 +17,30 @@ Packet 4 **slices A (model identity capture/display) and B (user-driven model
 selection through `/model`) complete** — picks up Packet 1's R10 ("pseudo-model
 `claude-code` is a placeholder"), left open through Packet 3. See the Packet 4
 section below.
+Packet 5 (dogfooding tuning) **complete — slices A (profile-local permission
+mode), B (gateway runtime metadata), D (persistence projection) and C
+(profile-safe skill bridge)**. The permission posture is now
+`model.claude_code_acp.permission_mode`, per profile, `default` unless opted out;
+the messaging gateway's runtime footer reports the live Claude Code model and the
+adapter's own context occupancy instead of `claude-code · 0%`; a tool-using turn
+leaves canonical `(assistant tool_calls, tool)` rows in `state.db`; and
+`model.claude_code_acp.skills` can put a bounded, manifest-owned, regenerated set
+of Hermes skills into the adapter's own `<config dir>/skills` — **off by
+default**. Slice C's one open wire question (skill-discovery timing) is settled
+against the pinned adapter's code *and* a live probe: discovery happens per
+session creation, so the links must exist before `session/new`. See the Packet 5
+section.
 
-Transcript-level tool rows (3A's R2) remain the one deferred Packet 3 item, and
-"deferred" has a concrete cost worth stating rather than closing by silence:
-`agent/claude_code_runtime.py` never splices `(assistant tool_calls, tool)` pairs
-into `messages` the way `agent/codex_runtime.py` does, so `agent/curator.py`,
-external-memory review, background-review snapshots and `session_search` all see
-a Claude Code turn as text with **no tool activity at all**. Packet 3's scope
-bullet says *display*, so this is not an acceptance failure — it is a parity gap
-with the sibling delegated runtime, scheduled, not closed. Two further items the
-review left open are also not implemented: a Hermes-side post-cancel grace
-deadline (3C R3 / review L1) and any adapter-side pre-approved-tool policy
-(3B R1 / 3C R1 / review M3).
+**Transcript-level tool rows (3A's R2) are now closed** by Packet 5 slice D:
+`agent/claude_code_runtime.py` splices the projector's
+`(assistant tool_calls, tool)` pairs into `messages` before the assistant text,
+the way `agent/codex_runtime.py` always has, so `agent/curator.py`,
+external-memory review, background-review snapshots and `session_search` see what
+a Claude Code turn *did* and not only what it said. No backfill: a session that
+ran before this lands keeps its text-only history and gains rows from its next
+turn on. Two items the Packet 3 review left open are still not implemented: a
+Hermes-side post-cancel grace deadline (3C R3 / review L1) and any adapter-side
+pre-approved-tool policy (3B R1 / 3C R1 / review M3).
 **Branch:** `feat/claude-code-acp-runtime`
 **Spike report:** [`2026-08-09-claude-code-acp-packet0-spike.md`](2026-08-09-claude-code-acp-packet0-spike.md)
 
@@ -88,6 +100,8 @@ precedent for this shape.
 | Session adapter | new `agent/claude_acp_session.py` | Analogue of `codex_app_server_session.py` (**exists, Packet 2**) |
 | Workspace roots | new `agent/claude_acp_workspace.py` | **Exists (Packet 3C)** — resolves `cwd` + explicitly-allowed `additionalDirectories` from `model.claude_code_acp.additional_directories`, and owns the root check every agent-initiated path is measured against |
 | Session binding + turn lease | new `agent/claude_acp_binding.py` | ACP session id + lease on the Hermes `sessions.model_config` row (**exists, Packet 2**) |
+| Permission posture | new `agent/claude_acp_permissions.py` | **Exists (Packet 5A)** — turns `model.claude_code_acp.permission_mode` into the mode negotiated against what the live session advertises, or into sending nothing at all (`inherit`) |
+| Skill bridge | new `agent/claude_acp_skills.py` | **Exists (Packet 5C)** — plans and materializes a bounded, manifest-owned link farm in the **adapter child's** `<config dir>/skills`, from `model.claude_code_acp.skills`. Off by default; the link dir is derived from the same `hermes_subprocess_env` the client spawns with, never `Path.home()` |
 | Event projection | new `agent/transports/claude_acp_event_projector.py` | Analogue of `codex_event_projector.py` (**exists, Packet 3A**), consumed through the `event_sink` seam on `ClaudeAcpSession.run_turn` and the bridge in `claude_code_runtime.make_claude_acp_event_bridge` |
 | Wire client | `agent/transports/claude_acp.py` | **Exists (Packet 0)** |
 | Permission bridge | `tools/approval.py::request_delegated_runtime_approval` | **Exists (Packet 3B)** — reuses the shared `_run_approval_gate` decision core; reached through the `permission_handler` seam on `ClaudeAcpSession.run_turn` and `claude_code_runtime.make_claude_acp_permission_bridge` |
@@ -313,8 +327,13 @@ open: transcript-level tool rows for curator/memory (3A's R2).
    platform.
 4. `/stop` mid-turn cancels within a bounded time; `stopReason == "cancelled"`;
    the lease is released and the next turn works.
-5. A test asserts the negotiated permission mode is the one Hermes requested —
-   a silent `auto` default is a security regression.
+5. A test asserts the negotiated permission mode is the one **Hermes' config**
+   requested — `default` unless the profile explicitly opted out (Packet 5
+   slice A). A silent `auto` default is a security regression; a written-down,
+   per-profile, WARNING-logged `auto` is a decision its owner made. The
+   invariant the check exists for survives verbatim: with no config key the
+   negotiated mode is still `default`, and nothing the adapter advertises can
+   produce a self-approving mode on its own.
 6. Paths outside the workspace roots are refused
    (`ensure_path_within_roots`, already tested).
 
@@ -467,7 +486,8 @@ carrying both the exact `model_id` and the normalized `label`), read through
 | Session-lifetime identity | `agent/claude_acp_session.py` | `ClaudeAcpSession._current_model_id` / `.current_model_id` — the LIVE adapter's answer: re-seeded unconditionally at every `_connect()` from that connection's own response, updated in `run_turn()` from the projector, dropped in `_drop_client()` with the adapter that reported it; `AcpTurnOutcome.model_id` carries it out per turn. `_remembered_model_id` / `_remembered_model_options` keep the last reported state for *recognition* after teardown (slice B's idle-adapter refusal), and are never offered as a live list |
 | Normalization + accessors | `agent/claude_code_runtime.py` | `normalize_claude_model_label()` (strips the `claude-` vendor prefix and a trailing 8-digit release-date suffix, keeping a `[1m]` context-lane marker), `_is_authoritative_model_id()` / `_option_label()` / `_selector_label()` (id vs picker selector — see above), `ClaudeAcpModelIdentity` (`.model_id` verbatim, `.label`, `.is_authoritative`), `claude_acp_model_identity(agent)`, `claude_acp_display_model(agent)`, captured post-turn by `_capture_model_identity()` |
 | Usage accounting | `agent/claude_code_runtime.py` | `claude_acp_usage_model()` (still reachable as `_usage_model_label()`) feeds the exact raw id — not the normalized label — to `estimate_usage_cost()` and both `_queue_token_counts()` call sites, falling back to `agent.model` (`"claude-code"`) before any identity is known AND when the reported value is a selector rather than an id |
-| Gateway displays | `gateway/slash_commands.py` | `_display_model_for()` / `_metadata_model_for()` — the same preference on `/usage`, `/context` and `/agents`; `/context` sizes its window from the accounting id, not the label. Added with slice B, which is what gave the gateway a `/model` to disagree with |
+| Gateway displays | `gateway/slash_commands.py` | `_display_model_for()` / `_metadata_model_for()` — the same preference on `/usage`, `/context` and `/agents`; `/context` sizes its window from the accounting id, not the label. Added with slice B, which is what gave the gateway a `/model` to disagree with. Both bodies now live in `gateway/model_identity.py` (Packet 5 slice B) so the gateway runtime footer reads the same two functions |
+| Gateway runtime footer | `gateway/run.py` (`_turn_runtime_metadata`) | The one surface this table was missing: `TurnRunner.run_sync` read `agent.model` directly, so the footer said `claude-code` while `/usage` in the same session said `sonnet-5`. Closed by Packet 5 slice B |
 | CLI footer | `cli.py` (`_get_status_bar_snapshot`) | Prefers `claude_acp_display_model(agent)` ahead of `agent.model`/`self.model` |
 | CLI usage report | `cli.py` (`_show_usage`) | Same preference for the "Model:" line |
 | Desktop/TUI footer | `tui_gateway/server.py` (`_session_info`) | Same preference, ordered after a pending `/model` switch (more specific and more recent) but ahead of the mirror/agent fallback |
@@ -695,6 +715,536 @@ is `claude_code_acp` *and* a live session advertises models.
 **Stop condition.** Met — no blocker. `session/set_config_option` is a stable,
 implemented verb on the pinned adapter, and the advertised option list gave the
 gating and allowlist answers the earlier `session/set_model` sketch could not.
+
+---
+
+## Packet 5 — dogfooding tuning
+
+**Source.** Real dogfooding feedback on a live profile, mapped to four
+independent slices (A: profile-local permission mode; B: gateway runtime
+metadata — the footer's `claude-code · 0%`; C: profile-safe skill bridge;
+D: persistence projection, which closes 3A's R2). Recommended order
+A → B → D → C; A and B touch none of each other's files. All four have landed in
+that order. Packet 5 is complete.
+
+### Slice A — profile-local permission mode ✅ COMPLETE
+
+**Goal.** The permission posture of a Claude Code session is a config decision
+the profile owner makes and can inspect, with the current behaviour as the
+default, and with the option of *not deciding* (letting Claude Code's own
+`settings.json` stand).
+
+**The bug it fixes.** `session/set_mode` → `default` ran on every connect from a
+module constant with no config path, so a profile's own
+`~/.claude/settings.json` `permissions.defaultMode` was honoured by the adapter
+at session creation and then immediately overwritten by Hermes. `model:` in the
+same file *did* take effect, because Packet 4A only ever reads the model and
+never writes it at session start. That asymmetry was the whole report, and it
+was one line of policy.
+
+**Config schema.** One new key, no `.env` mirror, no `HERMES_*` var, no
+`DEFAULT_CONFIG` entry and no `_config_version` bump — consistent with the two
+`claude_code_acp` keys that already live outside the defaults (`command`,
+`additional_directories`), and with AGENTS.md §Adding Configuration:
+
+```yaml
+model:
+  claude_code_acp:
+    permission_mode: default   # default | plan | acceptEdits | auto |
+                               # dontAsk | bypassPermissions | inherit
+```
+
+`default` (the default) and `plan` keep every permission request coming to
+Hermes. `acceptEdits` / `auto` / `dontAsk` / `bypassPermissions` are
+self-approving: the adapter decides most tool use itself, so Hermes' approval
+gate — and with it the unconditional floor (hardline blocklist, sudo-stdin
+guard, `approvals.deny`) — only measures what it is still asked about. `inherit`
+sends **no** `session/set_mode` at all.
+
+**Migration / default behaviour.** Absent key, unreadable config, non-string
+value, unknown value, a mode the live session does not advertise, and a session
+that reports no mode state at all **all** resolve to `default` — byte-identical
+to pre-Packet-5 behaviour. Every rejection narrows, and each logs one WARNING
+naming the value and the fallback. `inherit` is reachable only by naming it: no
+failure mode produces "Hermes negotiated nothing" by accident.
+
+**Seams landed.**
+
+| Seam | File | What it does |
+|---|---|---|
+| Config + policy | new `agent/claude_acp_permissions.py` | `CONFIG_KEYS`, `DEFAULT_PERMISSION_MODE`, `HERMES_GATED_MODES`, `SELF_APPROVING_MODES`, `INHERIT`, `KNOWN_MODES`; `configured_permission_mode()` (never raises, never validates); `resolve_permission_mode(configured, advertised)` — the whole policy in one pure function, `None` ⇒ send no `set_mode`; `describe_posture()` for the audit line |
+| Wire capture | `agent/transports/claude_acp.py` | `session_new()` / `session_load()` stash the response's `modes` block; `available_mode_ids` (`None` = no block at all, `[]` = advertises none — the same two-fact discipline as `available_model_options`) and `current_mode_id` read it back; `set_mode()` re-captures a `modes` block if the agent returns one |
+| Wire-shape extractors | `agent/transports/claude_acp_event_projector.py` | `extract_current_mode_id()` / `extract_available_mode_ids()` — siblings of Packet 4's model extractors. Unlike the model, the mode has a first-class ACP field and its own notification, so these read `modes`, not `configOptions` |
+| Mode-change projection | `agent/transports/claude_acp_event_projector.py` | `current_mode_update` → `ProjectedEvent(kind="mode_changed", mode_id=…)`, deduped within a turn exactly like `config_option_update`. State capture only: **no** display surface, no chat bubble, and deliberately no re-negotiation (answering a user's own live change with another `set_mode` would fight them, mid-turn, on the turn thread) |
+| Negotiation | `agent/claude_acp_session.py` | `PERMISSION_MODE` → `DEFAULT_PERMISSION_MODE`; ctor takes `permission_mode`; `_capture_mode_state()` + `_negotiate_permission_mode()` in `_connect()` resolve against **this** session's advertised list and skip `set_mode` entirely for `inherit`. An adapter that refuses the mode aborts the connect rather than prompting anyway |
+| Introspection | `agent/claude_acp_session.py` | `negotiated_permission_mode` (what Hermes sent; `None` for `inherit` or no connect) and `effective_permission_mode` (what the wire says is in force — `modes.currentModeId`, the negotiated mode, or a later `current_mode_update`). `AcpTurnOutcome.permission_mode` carries it out per turn |
+| Session identity | `agent/claude_acp_session.py` | `matches()` gains the mode: the live adapter has already been put into a posture, so a config change must rebuild rather than silently defer until the adapter is replaced (same argument as `additional_directories`) |
+| Runtime wiring | `agent/claude_code_runtime.py` | `_get_or_create_session()` takes the mode and passes `configured_permission_mode()` alongside `resolve_additional_directories(cwd)` |
+| Audit log | `agent/claude_acp_session.py` `_connect()` | Exactly one WARNING per connect when the negotiated mode is self-approving, or when `inherit` leaves the adapter's own mode in force — naming the mode and the fact that Hermes' gate will see few or no requests |
+
+**Deliberately unchanged.** The permission bridge
+(`make_claude_acp_permission_bridge`),
+`tools/approval.py::request_delegated_runtime_approval`, and the unconditional
+floor. Any request Hermes *does* receive, in any mode, goes through the same
+gate with the same deny-by-default. The mode changes how many requests exist,
+never what happens to one — asserted, parametrised over the mode, rather than
+argued.
+
+**Acceptance checks.**
+1. Default config ⇒ `set_mode_calls == ["default"]` on a new session **and** on
+   a rebind; the three pre-existing assertions in
+   `test_claude_code_runtime_safety.py`, `test_claude_code_permission_bridge.py`
+   and `test_claude_code_session_continuity.py` stay green untouched.
+2. `permission_mode: auto` ⇒ `["auto"]`, and the turn completes.
+3. `permission_mode: inherit` ⇒ zero `set_mode` calls, and
+   `effective_permission_mode` reports what `session/new` said `currentModeId`
+   was.
+4. A mode the live session does not advertise ⇒ `default` negotiated + one
+   WARNING; nothing unadvertised reaches the wire.
+5. An adapter that reports no `modes` at all ⇒ `default` negotiated, never
+   `inherit` by accident.
+6. A self-approving mode still routes any request that does arrive through
+   `request_delegated_runtime_approval`; a denial still blocks the write, and
+   the sudo-stdin floor still refuses without consulting a human.
+7. `matches()` is False when only `permission_mode` changed ⇒ the next turn
+   rebuilds the session.
+8. A mid-turn `current_mode_update` updates `effective_permission_mode` and
+   fires no display callback.
+9. All existing Claude ACP suites green — 604 tests across
+   `tests/agent/test_claude_code_*.py` and `tests/agent/transports/`, plus the
+   CLI/gateway/`hermes_cli`/TUI ACP files.
+
+**Test seams.** `agent/claude_acp_permissions.{configured_permission_mode,
+resolve_permission_mode}`; `ClaudeAcpSession(permission_mode=…)` /
+`.negotiated_permission_mode` / `.effective_permission_mode` / `.matches(argv,
+cwd, dirs, permission_mode)`; `ClaudeAcpClient.available_mode_ids` /
+`.current_mode_id` / `.session_modes`; the projector's `mode_changed`. The fake
+adapter gained `FAKE_ACP_MODES`, `FAKE_ACP_NO_MODES`, `FAKE_ACP_CURRENT_MODE`,
+`FAKE_ACP_REJECT_SET_MODE`, `FAKE_ACP_SWITCH_MODE` and a `mode-switch` turn
+mode, and now answers `session/new` / `session/load` with a real `modes` block;
+the Packet 0 fake agent (`tests/agent/transports/_fake_acp_agent.py`) answers
+with one too and validates `session/set_mode` against it. New file
+`tests/agent/test_claude_code_permission_mode.py` (44 tests), plus
+`TestPermissionModeState` in `tests/agent/transports/test_claude_acp.py` and
+`TestExtractModeState` in the projector's test file.
+
+**Safety invariants.** The unconditional approval floor, prompt caching, role
+alternation, workspace roots, credential scrubbing and `agent.model` are all
+untouched. The one guarantee this slice genuinely lets a profile owner give up
+is Hermes' visibility into the requests a self-approving adapter answers itself
+— which is why it is an enumerated opt-in, per profile, logged once per connect,
+and documented in the key's own comment.
+
+**Open question carried forward (not implemented here).** Should a
+self-approving mode be refused when the turn is non-interactive and
+`approvals.cron_mode: deny`? That is the one place this design lets config
+remove a guarantee `tools/approval.py` currently makes unconditionally.
+Recommendation: refuse it there, log once, negotiate `default` — opting into
+`auto` for your own chat is a different decision from opting into it for
+unattended cron. Left for a follow-up so this slice stays the one policy
+function it is.
+
+### Slice B — gateway runtime metadata ✅ COMPLETE
+
+**Goal.** Every gateway metadata consumer sees the model Claude Code is
+actually running and the context occupancy Claude Code actually reported,
+through the same seam the other four surfaces already use.
+
+**The bug it fixes.** The reported footer was `claude-code · 0% · ~/projects`
+for a session running Opus a third of the way through its window. Both halves
+came from four lines in `TurnRunner.run_sync` that read the **agent object**
+where the CLI status bar, `/usage`, `/context` and the TUI's `session.info`
+read the **runtime seam**: `agent.model` is the static pseudo-model Packet 4A
+deliberately never mutates (the gateway's agent cache evicts on a changed
+`model`, so writing it would rebuild the agent and destroy prompt caching), and
+Hermes' compressor is deliberately not driven on this runtime (Packet 3A), so
+`last_prompt_tokens` was 0 against a non-zero window — and `round(0/N*100)`
+renders as a real-looking `0%`. The runtime was already returning better
+numbers (`context_used_tokens` / `context_window_tokens` from `usage_update`)
+and `run_sync` overwrote them.
+
+**Config schema.** None. No new keys; `display.runtime_footer.{enabled,fields}`
+already exists. No migration: for every non-ACP agent the new function returns
+field-for-field what the four lines returned.
+
+**Seams landed.**
+
+| Seam | File | What it does |
+|---|---|---|
+| Shared display seam | new `gateway/model_identity.py` | `display_model_for(agent)` / `metadata_model_for(agent)` — the two staticmethods from `gateway/slash_commands.py` moved out verbatim, so the footer can reach them without importing the turn runner. The staticmethods stay as one-line delegations: `/usage`, `/context` and `/agents` cannot drift from the footer because there is one implementation |
+| Testable metadata function | `gateway/run.py` `_turn_runtime_metadata(agent, result)` | Module-level, no event loop, no adapter, no `TurnContext` — which is what makes the slice testable at all (`run_sync` is ~1300 lines). Returns `{model, model_id, context_length, last_prompt_tokens, input_tokens, output_tokens}`; `run_sync` calls it once and spreads it into both result dicts |
+| Resolution order | same | `model`: display label → `agent.model`. `context_length`: adapter-reported `context_window_tokens` → compressor → 0. `last_prompt_tokens`: adapter-reported `context_used_tokens` (the number Claude Code's own `/context` shows) → the compressor's reading, **including its `-1` "unknown" sentinel** → the turn's own reported prompt tokens → 0. A reported value that is absent, the wrong type, or negative falls through rather than becoming a number on someone's footer |
+| Id path kept separate | `gateway/run.py` | New `model_id` key carries `metadata_model_for()` — an id, never a label — and the `agent:end` hook payload reads it, so hook handlers keep correlating on the same shape they always did |
+| Occupancy kept out of the compression heuristic | `gateway/run.py` | New `transcript_prompt_tokens` key carries the compressor's reading alone, and the session entry stores *that*. Session hygiene sizes this session's own history with the stored value before deciding to auto-compress it, and a delegated runtime's window occupancy — which counts tool traffic Hermes never stored — is not a measurement of that history. Identical to `last_prompt_tokens` on every runtime that drives the compressor, so nothing else moves |
+| Occupancy survives a quiet turn | `agent/claude_acp_session.py` | `_last_context_usage`: `usage_update` arrives on a per-turn projector, but how full the window is, is a standing fact about the *session*. `AcpTurnOutcome.context_usage` falls back to it, so the footer no longer flickers between a real percentage and none. Dropped in `_drop_client` with the adapter that reported it, and **carried forward with its cost stripped** — occupancy is a standing fact, a cost is an event, and re-reporting one would invent spend that never happened |
+
+**Deliberately unchanged.** `agent.model` (Packet 4A's finding: the agent cache
+evicts on it), Hermes' compressor (Packet 3A's decision),
+`gateway/runtime_footer.py` (already correct), and
+`conversation.last_resolved_model` — audited and confirmed to be fed from
+config resolution, never from this dict, so no display label can reach the
+model a recovery turn rebuilds an agent with.
+
+**Acceptance checks.**
+1. `_turn_runtime_metadata` returns the display label for an ACP agent with a
+   captured identity, and `agent.model` for every other agent.
+2. Occupancy comes from the adapter when reported, the compressor otherwise;
+   a turn that reported real occupancy no longer renders `0%`.
+3. `agent.model` is bit-for-bit unchanged, so no cached agent is evicted by the
+   post-turn `_agent.model != _cfg_model` check.
+4. Footer, `/usage`, `/context` and `/agents` report the same label for the same
+   agent — asserted as function identity, not as three matching strings.
+5. A turn that emits no `usage_update` reuses the session's last snapshot
+   rather than dropping to `0%`, and reports no cost for it.
+6. The Codex app-server runtime (which drives the compressor *and* returns
+   `last_prompt_tokens`) is unaffected, and the post-compaction `-1` sentinel
+   still suppresses the field.
+7. `tests/gateway/` (5161), `tests/cli/` (959), `tests/test_tui_gateway_server.py`
+   and the ACP suites green.
+
+**Test seams.** `gateway.model_identity.{display_model_for,metadata_model_for}`;
+`gateway.run._turn_runtime_metadata(agent, result)`;
+`gateway.runtime_footer.build_footer_line(...)` for the end-to-end string. New
+file `tests/gateway/test_runtime_footer_claude_acp.py` (15 tests, including the
+red-capable `opus-5 · 37% · ~/projects` — a behaviour under fixed inputs, not a
+catalog snapshot), the shared-seam assertion in
+`tests/gateway/test_claude_acp_model_display.py`, and two occupancy-lifetime
+tests in `tests/agent/test_claude_code_event_projection.py` driven through a new
+`usage-once` fake-adapter mode (occupancy reported on the first turn of a
+session and never again).
+
+### Slice D — persistence projection ✅ COMPLETE
+
+**Goal.** A Claude Code turn leaves the same shape in `state.db` as a Codex turn,
+so `session_search`, `agent/curator.py`, external-memory review and
+background-review snapshots see the tool activity — with no duplicated bubble, no
+broken alternation, no orphan `tool_calls`, and no cache effect. Closes 3A's R2.
+
+**The gap it fixes.** The turn appended exactly one message
+(`{"role": "assistant", "content": final_text}`) and flushed it. Measured on the
+reporter's live DB: 6 `role='tool'` rows from the native agent, **0** across ~16
+Bash calls under Claude Code, and `sessions.tool_call_count` frozen at 6.
+`hermes_state.py`'s counter is driven by `num_tool_calls` at append time, so it
+was right — there was nothing to count.
+
+**Config schema.** One new key, no `.env` mirror, no `HERMES_*` var, no
+`DEFAULT_CONFIG` entry and no `_config_version` bump — same treatment as the
+three `claude_code_acp` keys already outside the defaults:
+
+```yaml
+model:
+  claude_code_acp:
+    persist_tool_calls: true   # default TRUE — a kill switch, not a feature gate
+```
+
+It governs **both** state.db writes this slice makes (the transcript pairs and
+the activity stamp), because they are one decision: "keep a Hermes-side record of
+what the adapter did". Default on, because parity with the sibling delegated
+runtime is what the plan asked for, codex has no equivalent flag, and there is no
+user-visible surface to regress. It exists at all because the rows land in a live
+session DB a heavy user has already grown to hundreds of megabytes. Every
+rejection (absent key, unreadable config, non-flag value) resolves to `true` and
+a non-flag value logs one WARNING.
+
+**Seams landed.**
+
+| Seam | File | What it does |
+|---|---|---|
+| Transcript rows | `agent/transports/claude_acp_event_projector.py` | `projected_messages` — one `(assistant tool_calls, tool)` pair per completed tool call, in completion order, built by `_transcript_pair()`. `PERSISTED_RESULT_MAX_CHARS` (4000) + a counted `… [+N chars truncated]` marker; `UNREPORTED_TOOL_RESULT` for the orphan repair; `[failed]` marks a failed call, since a row has only its text where the display surface has structured `is_error` |
+| Bound split | same | `_scrubbed_result_text()` (scrubbed, unbounded) now feeds both the display cut and the transcript cut. Scrub once, before either — cutting first can split a secret into a prefix the redactor no longer recognises — and the row is **not** derived from the display string, whose bare ellipsis carries no count |
+| Orphan repair | same | Computed on *read*, not flushed by a caller: a tool with no terminal update is closed inside `projected_messages`, so **every** exit path (success, non-`end_turn` stop, cancel mid-tool) yields a list with no orphan `tool_calls` row, reading twice gives the same list, and there is no "someone forgot to call flush" failure mode |
+| Turn carrier | `agent/claude_acp_session.py` | `AcpTurnOutcome.projected_messages`, read once after the prompt settles |
+| The splice | `agent/claude_code_runtime.py` | `messages.extend(outcome.projected_messages)` → assistant text → **one** `_persist`. Order: `user` → `[assistant(tool_calls), tool]*` → `assistant(text)` |
+| Kill switch | `agent/claude_code_runtime.py` | `PERSIST_TOOL_CALLS_CONFIG_KEYS`, `claude_acp_persist_tool_calls()` — read once per turn, not per event |
+| Activity clock | `agent/claude_code_runtime.py` | `make_claude_acp_event_bridge(agent, observe_activity=…)` calls `_touch_activity(f"claude code: {tool.name}")` on each completed tool (adjacent finding 0.5.1). Mid-turn deliberately: a stamp written at turn end says nothing about liveness. `last_activity_description` is still cleared when the turn ends by `_reset_activity_labels_after_turn` — that is Hermes' own design (#72039), so the durable gain here is `last_activity_at` |
+| Fake adapter | `tests/agent/_fake_claude_acp_adapter.py` | `FAKE_ACP_HUGE_TOOL_OUTPUT` (oversized result) and a `cancel-mid-tool` mode — a `tool_call` that never reports an outcome, the one shape that can produce an orphan |
+
+**Why the cache and alternation are safe.** This runtime never replays `messages`
+into the adapter (Hermes sends the new turn only), so the rows are Hermes-side
+records and the adapter's prompt cache is untouched. The one thing that ever goes
+back is the reseed recap, and `_build_recap` filters to string-content
+user/assistant rows — which excludes both the tool rows and the `content=None`
+assistant rows carrying `tool_calls`. Asserted byte-identical, not argued.
+Alternation holds because the pairs sit between the user row and the reply.
+
+**Why there is no duplicate bubble.** Display and persistence are two disjoint
+consumers of one projector: the event bridge fires the callbacks and appends no
+message; `projected_messages` is read once at turn end and fires no callback.
+Asserted as *equal callback counts with the switch on and off*, not argued. A
+`session/load` replay cannot manufacture rows either — the projector is
+constructed after `_connect()` and after `drain_inbox()`, and only
+`client.prompt`'s `on_update` feeds it.
+
+**Also verified rather than assumed.** New `role:"tool"` rows cannot start
+auto-delivering attachments: `gateway/run.py` gates MEDIA extraction on
+`_AUTO_APPEND_MEDIA_TOOL_NAMES` (four Hermes tool names), and `Bash`/`Write`/
+`Read` are not among them. `agent_persisted` stays `True`, so the gateway still
+writes nothing — flipping it would re-INSERT the already-flushed user turn
+(#860/#42039).
+
+**Acceptance checks.**
+1. A tool-using turn writes one `(assistant tool_calls, tool)` pair per completed
+   tool; `role='tool'` count == completion count == 4; `tool_call_count` advances
+   to 4; ids are `deterministic_call_id(<adapter toolCallId>)`.
+2. Neither planted credential appears anywhere in any persisted row, and the
+   secret argument is masked rather than dropped.
+3. No orphan `tool_calls` row on any exit path — including a stop mid-tool, which
+   lands a repaired pair carrying `UNREPORTED_TOOL_RESULT`.
+4. Exactly one user row and exactly one final assistant text row;
+   `agent_persisted` stays `True`.
+5. Display callback counts are identical with recording on and off.
+6. `session_search` finds a tool result by its text.
+7. `_build_recap` is byte-identical with and without tool rows.
+8. `persist_tool_calls: false` reproduces the pre-slice transcript exactly —
+   `["user", "assistant"]`, `tool_call_count == 0`, `last_activity_at` NULL.
+9. `last_activity_at` is non-NULL after a tool-using turn.
+10. An oversized result is truncated with a marker naming how much was dropped;
+    an ordinary result is untouched.
+11. All Claude ACP suites green — 563 tests across the 21 test files that
+    touch this runtime (`grep -rln 'claude_acp\|claude_code_acp\|_fake_claude_acp'
+    tests/`, minus the two files where the runtime is incidental,
+    `test_cli_status_bar.py` and `test_tui_gateway_server.py`) — plus
+    curator/state (407), `session_search` + codex-persist parity (68), and every
+    suite that touches `_flush_messages_to_session_db` / `agent_persisted` (1190
+    across 39 files). The earlier "477 across 16 files" here counted only the
+    `agent/` + `transports/` + two gateway files and read as though it were the
+    whole runtime; the criterion is now stated so the number can be reproduced.
+
+**Test seams.** `ClaudeAcpEventProjector.projected_messages`,
+`PERSISTED_RESULT_MAX_CHARS`, `UNREPORTED_TOOL_RESULT`, `deterministic_call_id`;
+`AcpTurnOutcome.projected_messages`;
+`claude_code_runtime.claude_acp_persist_tool_calls()`;
+`make_claude_acp_event_bridge(agent, observe_activity=…)`. New file
+`tests/agent/test_claude_code_transcript_projection.py` (39 tests, real
+fake-adapter subprocess + real temp `SessionDB` — the failure was found by
+querying `state.db`, so that is what the tests query), plus
+`TestTranscriptProjection` (28 pure-data tests) in the projector's test file.
+`test_role_alternation_holds` in `test_claude_code_event_projection.py` was
+updated: it froze the pre-slice row list, and now asserts the invariant (no
+adjacent same-role rows, ends on the assistant) plus the new canonical order.
+
+**Open question carried forward.** Keep `persist_tool_calls` at all? Codex has no
+equivalent. Recommendation unchanged: keep it for one release as a dogfooder
+retreat, then delete it.
+
+### Slice C — profile-safe skill bridge ✅ COMPLETE
+
+**Goal.** A configured, bounded, inspectable set of Hermes skills becomes
+discoverable to Claude Code inside the profile, with no always-loaded prompt
+bloat, no global-symlink breakage, and no writes anywhere Hermes does not own.
+
+**The gap it fixes.** `<adapter HOME>/.claude/skills` did not exist, so the
+adapter's session saw only Claude-native and plugin skills and nothing Hermes
+owns. Hermes' layout is `<root>/<category>/<skill>/SKILL.md` — two levels where
+Claude Code's personal-skill discovery is one — across three roots holding 256
+skills with 20+ duplicate basenames, so the bridge has to flatten and a flat farm
+cannot be collision-free by construction. "Link everything" was never an option.
+
+**The wire question, settled.** The map recorded discovery timing as
+**(inferred)**. It is now measured, twice:
+
+- *Adapter code.* `createSession` in
+  `@agentclientprotocol/claude-agent-acp@0.66.0` (`dist/acp-agent.js:4562`)
+  builds the SDK `query()` and `await`s `q.initializationResult()`, and both
+  `session/new` and `session/load` route through it. The SDK resolves its config
+  dir as `process.env.CLAUDE_CONFIG_DIR ?? homedir()/.claude`
+  (`@anthropic-ai/claude-agent-sdk@0.3.220`, `sdk.mjs`), and the `~/.claude/skills`
+  auto-load is the `@skills-dir` plugin scan the settings schema names. The SDK
+  exposes a `reloadSkills()` control request; **the adapter never calls it**.
+- *Live probe* (`initialize` + two `session/new`, no prompt, temp `HOME`, so no
+  model quota): a skill present before `session/new` **is** discovered; one added
+  afterwards is **not**, and no `commands_changed` / `available_commands_update`
+  arrives; a second `session/new` on the **same adapter process** does pick it
+  up.
+
+So discovery is **per session creation** — not per process, not per prompt. The
+timing constraint the map inferred holds exactly, and nothing else in the design
+changed. The consequence for `matches()` is now a measurement rather than a
+preference: a live adapter genuinely cannot be re-scoped, so a skills-config
+change takes effect at the next connect.
+
+**Config schema.** One new key tree, no `.env` mirror, no `HERMES_*` var, no
+`DEFAULT_CONFIG` entry and no `_config_version` bump — same treatment as the four
+`claude_code_acp` keys already outside the defaults:
+
+```yaml
+model:
+  claude_code_acp:
+    skills:
+      bridge: off          # off | link      (DEFAULT: off — zero fs writes)
+      roots: []            # extra skill roots; [] = Hermes' own resolved roots
+                           #   (get_skills_dir() + skills.external_dirs)
+      include: []          # REQUIRED for `link`. Selectors, config order:
+                           #   "software-development/code-review"  exact
+                           #   "code-review"                       bare name
+                           #   "software-development/*"            one category
+                           # No "**", no regex, no bare "*".
+      exclude: []          # same grammar, applied after include
+      max_links: 40        # clamped to 200; overflow is dropped AND named
+      prune_unmanaged: false   # never the recommendation; see below
+      link_dir: ""         # override; default <adapter config dir>/skills
+```
+
+`bridge: off` by default ⇒ no directory, no manifest, no writes, and every
+pre-existing suite untouched. `bridge: link` with an empty `include` links
+**nothing** and logs one WARNING: an explicit allow-list, never an implicit
+"everything".
+
+**Seams landed.**
+
+| Seam | File | What it does |
+|---|---|---|
+| Config | **new** `agent/claude_acp_skills.py` | `CONFIG_KEYS`, `BridgeConfig`, `resolve_bridge_config()`, `parse_selectors()`. Every rejection narrows to `off` / fewer links |
+| Where | same | `child_spawn_env()` + `default_link_dir()` — built from the **same** `hermes_subprocess_env` → `apply_subprocess_home_env` chain `ClaudeAcpClient` spawns with, honouring `CLAUDE_CONFIG_DIR` then `HOME`/`USERPROFILE`. One source of truth, so the dir Hermes writes and the dir the child reads cannot drift. Never `Path.home()` (AGENTS.md §Profiles rule 1) |
+| Plan | same | `discover_skills()` (depth ≤ 2, readable `SKILL.md` required, `skills.disabled` honoured), `plan_skill_links()` → `SkillLinkPlan(links, dropped_over_cap, unmatched_selectors, refused_outside_roots, tool_vocabulary_notes)`. Pure: reads, never writes |
+| Naming | same | `<skill>` when unique in the plan; else `<category>-<skill>`; else `<root-slug>-<category>-<skill>`, where a root slug that is not unique carries a digest of the root path. Escalation is recomputed over the whole set each round, so **root order cannot change the answer** |
+| Materialize | same | `materialize_skill_links()` + `read_manifest()`. `<link_dir>/.hermes-claude-skills.json` (`version`, `generated_by`, `config_hash`, `link_dir`, `links[]`) written atomically via a temp file + `replace` |
+| Hook | `agent/claude_acp_session.py` `_connect()` | one guarded `bridge_skills()` before the client is even spawned — strictly earlier than `session/new`, so an adapter that ever moved the scan to startup would still see the links. Result kept on the session as `last_skill_bridge_result` |
+| Fake adapter | `tests/agent/_fake_claude_acp_adapter.py` | `skills_dir_listings` — the child dumps its own `<CLAUDE_CONFIG_DIR or $HOME/.claude>/skills` listing **at `session/new` / `session/load`**, plus the `usable` subset it can actually read through. That is what makes the E2E an assertion about *ordering* rather than about files existing by the end of the turn |
+
+**Manifest ownership is the whole safety story.** Only names the manifest claims
+are ever replaced or removed. An entry it does not claim — a real directory, a
+hand-made symlink, anything — is left completely alone and reported as
+`skipped_unmanaged`, and it is not adopted into the manifest either. A missing,
+unreadable, malformed or future-versioned manifest owns **nothing**, which is the
+narrow reading. A real directory is never replaced even when the manifest *does*
+claim it: deleting a human's skill to install ours is the one unrecoverable move
+available here. `prune_unmanaged` exists only so the option is explicit; it
+defaults false, it removes stray *symlinks* only, and the recommendation is never
+to set it.
+
+This matters concretely: the reporter's real `~/.claude/skills` holds **8
+hand-made symlinks**, dangling since the 2026-07-27 reorg pointed them at a flat
+`core-skills/<name>` layout that no longer exists. On a **non-container** host
+install `get_subprocess_home()` returns `None`, so the adapter's `HOME` *is* the
+real user home and that is exactly the directory this bridge would write into.
+Under this design those 8 links are reported and untouched. (On the reporter's
+own host `is_container()` is true, so the link dir is
+`{HERMES_HOME}/home/.claude/skills` — measured, not assumed.)
+
+**Self-healing is the other half.** Managed links are regenerated from config on
+every connect, so the created-once-and-never-regenerated failure the 8 stale
+links represent is structurally impossible for managed entries: a managed link
+whose target moved is repointed, and one whose skill vanished is removed (and
+counted separately when it was already dangling, `broken_pruned` vs `removed`).
+
+**Fail-open, and never a turn.** `bridge_skills()` cannot raise. A read-only
+home, a Windows symlink-privilege refusal, an unreadable config — each costs one
+WARNING and a session with no bridge. Per-entry failures are collected rather
+than aborting the batch, so one bad link cannot cost the other thirty-nine.
+**No copy fallback on Windows**: a stale copy of a skill is worse than no skill,
+and it would write into a tree Hermes does not own.
+
+**Containment.** A skill directory that resolves outside every configured root is
+refused (`refused_outside_roots`) rather than linked. Skills are meant to be
+readable; *which* tree the adapter can read through a Hermes-made link is still a
+decision, and this keeps the guarantee statable. Nothing is ever written into a
+skill root — `skills.external_dirs` are externally owned, and a test asserts the
+root tree is byte-for-byte unchanged across a materialization.
+
+**Tool vocabulary — the feature's real correctness risk.** AGENTS.md §Skill
+authoring standards rule 2 requires Hermes SKILL.md prose to name **Hermes**
+tools in backticks (`read_file`, `terminal`, `patch`, `search_files`). The Claude
+Code session has none of them; it has `Read`, `Bash`, `Edit`, `Grep`. A bridged
+skill written in Hermes' vocabulary will instruct the model to call tools that do
+not exist in that session. That is a correctness problem, not a safety one, and
+it is why `include` is an explicit allow-list with no default.
+
+`agent/claude_acp_skills.py` carries the translation table
+(`HERMES_TO_CLAUDE_TOOLS`) and reports — never rewrites — per bridged skill:
+`SkillLink.hermes_tool_mentions`, surfaced in `SkillLinkPlan.tool_vocabulary_notes`
+and logged once per connect. Detection is **backtick-scoped** deliberately: bare
+"terminal" and "recall" are ordinary English and would otherwise flag almost
+everything. Rewriting an external skill to fix its vocabulary is out of the
+question — external dirs are externally owned, and a Hermes-side edit would be a
+silent fork.
+
+Measured on this host, which is why the recommendation below is what it is:
+
+| Root | SKILL.md files | Name a Hermes tool in backticks |
+|---|---|---|
+| `~/.hermes/core-skills` | 23 | **0** |
+| `~/.hermes/profiles/pewds/skills` | 150 | **55** |
+
+**Recommended pewds opt-in (not applied — no live config was edited).** Core
+skills only, which is the root whose prose is already tool-agnostic:
+
+```yaml
+model:
+  claude_code_acp:
+    skills:
+      bridge: link
+      roots:
+        - /home/me/.hermes/core-skills
+      include:
+        - software-development/code-review
+        - software-development/diagnosing-bugs
+        - software-development/tdd
+        - productivity/grilling
+        - productivity/writing-for-agents
+        - autonomous-ai-agents/handoff
+```
+
+Naming `roots` explicitly is what keeps a bare-name selector from reaching into
+the 150-skill profile root. Read the two comments together with slice A's
+`permission_mode`: a self-approving mode plus a bridged skill that shells out is
+the widest combination in this packet.
+
+**Cache and identity.** Nothing here touches the system prompt or replays
+context: links cost the adapter roughly one `name` + `description` line each via
+its own progressive disclosure, on its side of the wire. `matches()` deliberately
+does **not** include the skills config — a changed key takes effect at the next
+connect, not by retiring a healthy adapter mid-conversation. Stated as a decision
+so it is not read as an omission.
+
+**Acceptance checks.**
+1. `bridge: off` (default) ⇒ no directory created, no manifest, the child's
+   listing at `session/new` is `[]`, and the 21 pre-existing runtime suites are
+   untouched.
+2. Configured skills appear as links **before** `session/new`, and the child can
+   read `SKILL.md` through them (`usable == entries`).
+3. A basename collision across two roots produces two distinct deterministic
+   names; a collision that survives the category gets the root slug; neither is
+   silently dropped; reordering the roots does not change the names.
+4. An unmanaged entry — real directory or hand-made symlink — is never
+   overwritten, is reported, and is not adopted into the manifest.
+5. A managed link whose target moved is repaired on the next connect; a broken
+   one self-heals; one whose skill vanished is pruned and drops out of the
+   manifest.
+6. `max_links` overflow is dropped, **named**, and logged with the count kept.
+7. The link dir resolves under the child's home: two different `HERMES_HOME`s
+   with `terminal.home_mode: profile` get two different dirs, and
+   `CLAUDE_CONFIG_DIR` wins over `HOME` exactly as the SDK resolves it.
+8. A materialization failure (read-only dir) logs a WARNING and the turn still
+   completes normally.
+9. Prompt cost is bounded: the plan length is ≤ `max_links` (the honest proxy —
+   Hermes cannot measure Claude's own context).
+10. A skill naming Hermes tools is reported; a tool-agnostic one is not; the
+    SKILL.md file is byte-identical after materialization.
+11. All Claude ACP suites green (637 across 22 files — the 21 that slice D's
+    check names, plus the new one), and 2293 across 64 files for the combined
+    ACP + skills + subprocess-HOME/profile sweep. The developer's real
+    `~/.claude/skills` is byte-identical afterwards, stale links and all.
+
+**Test seams.** `resolve_bridge_config()`, `parse_selectors()`,
+`default_link_dir()`, `child_spawn_env()`, `discover_skills()`,
+`plan_skill_links()`, `materialize_skill_links()`, `read_manifest()`,
+`bridge_skills()`, `HERMES_TO_CLAUDE_TOOLS`;
+`ClaudeAcpSession.last_skill_bridge_result`; the fake adapter's
+`skills_dir_listings`. New file `tests/agent/test_claude_code_skill_bridge.py`
+(74 tests: 67 pure, 7 driving a REAL fake-adapter subprocess over real stdio).
+The ordering tests were confirmed red-capable by stubbing the `_connect()` hook:
+5 of the 7 fail with an empty listing, a missing link, or a `None` result — the
+other 2 assert absence and correctly stay green.
+
+`HOME` is set per test. `tests/conftest.py` isolates `HERMES_HOME` but
+deliberately **not** `HOME`, and this is the one feature in the runtime whose
+output path is derived from it — an un-isolated test would write links into the
+developer's real `~/.claude/skills`, next to the 8 stale ones.
+
+**Open question carried forward.** `prune_unmanaged` has no known legitimate use:
+it exists so the option is explicit rather than implied by the manifest design.
+If a release goes by without anyone setting it, delete the key.
 
 ---
 

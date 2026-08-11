@@ -130,6 +130,22 @@ class TestTheSeams:
         assert runner._display_model_for(agent) == "claude-code"
         assert runner._metadata_model_for(agent) == "claude-code"
 
+    def test_the_command_seams_are_the_shared_module_level_ones(self):
+        """Packet 5 slice B moved both bodies into ``gateway/model_identity.py``
+        so the runtime footer could reach them without importing a 1300-line
+        turn runner. The staticmethods stay as the commands' spelling of the
+        same question — delegations, never a second implementation that can
+        drift from the footer."""
+        from gateway.model_identity import display_model_for, metadata_model_for
+
+        runner = _runner()
+        agent = _claude_code_agent(_identity())
+
+        assert runner._display_model_for(agent) == display_model_for(agent)
+        assert runner._metadata_model_for(agent) == metadata_model_for(agent)
+        assert display_model_for(agent) == "sonnet-5"
+        assert metadata_model_for(agent) == _SONNET
+
     def test_a_selector_identity_displays_a_name_and_meters_the_pseudo_model(self):
         """The two seams answer differently, and that is the point: a picker
         selector names no model, so it can be shown but not looked up."""

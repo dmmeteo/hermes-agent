@@ -289,6 +289,14 @@ class ClaudeAcpClient:
         #: option list's "model" entry, so this is captured verbatim here and
         #: read back through :attr:`current_model_id`.
         self.session_config_options: Optional[list] = None
+        #: Raw ``modes`` block from the most recent ``session/new`` /
+        #: ``session/load`` response (``{currentModeId, availableModes}``).
+        #: Unlike the model, the permission mode has a first-class ACP field, so
+        #: this is captured verbatim and read back through
+        #: :attr:`available_mode_ids` / :attr:`current_mode_id`. ``None`` means
+        #: the response carried no ``modes`` key at all — a different fact from
+        #: a session that advertises none.
+        self.session_modes: Optional[dict] = None
 
         self._reader = threading.Thread(
             target=self._read_stdout, name="acp-stdout", daemon=True
@@ -360,6 +368,42 @@ class ClaudeAcpClient:
         if not has_model_config_option(self.session_config_options):
             return None
         return extract_model_options(self.session_config_options)
+
+    @property
+    def available_mode_ids(self) -> Optional[list[str]]:
+        """Every permission mode the current session advertises, or ``None``.
+
+        ``None`` when the last session response carried no ``modes`` block at
+        all (an older adapter build, or no session yet); ``[]`` when it carried
+        one advertising nothing. The same two-fact discipline
+        :attr:`available_model_options` keeps, and for the same reason: a
+        response that says nothing about modes is not evidence that the mode a
+        profile configured is available, and neither is one that says there are
+        none (see ``agent/claude_acp_permissions.resolve_permission_mode``).
+        """
+        if not isinstance(self.session_modes, dict):
+            return None
+        from agent.transports.claude_acp_event_projector import (
+            extract_available_mode_ids,
+        )
+
+        return extract_available_mode_ids(self.session_modes)
+
+    @property
+    def current_mode_id(self) -> Optional[str]:
+        """The permission mode this session reports it is in, or ``None``.
+
+        Read from the same captured block. This is what the adapter derived on
+        its own — from its ``~/.claude/settings.json``
+        ``permissions.defaultMode`` — *before* the client negotiates anything,
+        which is exactly what the ``inherit`` posture needs in order to be
+        statable rather than a shrug.
+        """
+        from agent.transports.claude_acp_event_projector import (
+            extract_current_mode_id,
+        )
+
+        return extract_current_mode_id(self.session_modes)
 
     @property
     def supports_additional_directories(self) -> bool:
@@ -594,7 +638,19 @@ class ClaudeAcpClient:
         config_options = result.get("configOptions")
         if isinstance(config_options, list):
             self.session_config_options = config_options
+        self._capture_modes(result)
         return session_id
+
+    def _capture_modes(self, result: dict) -> None:
+        """Stash a session response's ``modes`` block, or clear it.
+
+        Absence is captured as much as presence: a reconnect that lands on an
+        adapter build reporting no mode state must read as "this session says
+        nothing about modes", never as the previous connection's answer. Same
+        rule as ``ClaudeAcpSession._capture_model_state``, one level down.
+        """
+        modes = result.get("modes")
+        self.session_modes = modes if isinstance(modes, dict) else None
 
     def set_mode(
         self,
@@ -604,16 +660,30 @@ class ClaudeAcpClient:
     ) -> dict:
         """Select the session's permission mode.
 
-        The Claude Code adapter starts in ``auto``, where a classifier
-        approves or denies tool use without ever asking the client. Hermes
-        must move it to ``default`` so permission decisions come back to us as
-        ``session/request_permission``.
+        The Claude Code adapter starts in ``auto``, where a classifier approves
+        or denies tool use without ever asking the client. Which mode Hermes
+        moves it to is the profile's decision
+        (``model.claude_code_acp.permission_mode``, resolved by
+        ``agent/claude_acp_permissions.py``), defaulting to ``default`` so
+        permission decisions come back to us as
+        ``session/request_permission``. The caller sends no call at all for the
+        ``inherit`` posture — an unsent RPC, not a special value.
+
+        Raises :class:`AcpError` when the agent refuses the mode. Nothing local
+        is updated on that path: the captured ``modes`` block still describes
+        what the session reported, and the caller must treat a refused
+        negotiation as a failed connect rather than prompting anyway.
         """
-        return self.request(
+        result = self.request(
             "session/set_mode",
             {"sessionId": session_id, "modeId": mode_id},
             timeout=timeout,
         )
+        # An agent MAY answer with the refreshed mode state; 0.66.0 answers
+        # `{}`. Read it when it is there rather than assuming either shape.
+        if isinstance(result, dict) and isinstance(result.get("modes"), dict):
+            self._capture_modes(result)
+        return result
 
     def set_config_option(
         self,
@@ -635,11 +705,14 @@ class ClaudeAcpClient:
         captured identity exactly as it was.
 
         SECURITY: this verb is generic — the same call writes ``mode``, whose
-        values include ``bypassPermissions`` and ``acceptEdits``. Packet 1's
-        entire containment story is the ``default`` mode negotiated in
-        ``ClaudeAcpSession._connect()``, so a permission mode must keep going
-        through :meth:`set_mode` on that path and must never be reached for
-        through this one.
+        values include ``bypassPermissions`` and ``acceptEdits``. The permission
+        posture is negotiated once per connect in
+        ``ClaudeAcpSession._connect()``, from one config key and through
+        :meth:`set_mode` alone (``agent/claude_acp_permissions.py`` owns the
+        policy). It must never be reached for through this path: a mode written
+        here would bypass the config gate, the advertised-list check and the
+        audit line, and would leave the session's own captured mode state
+        describing a posture it is no longer in.
         """
         result = self.request(
             "session/set_config_option",
@@ -688,6 +761,7 @@ class ClaudeAcpClient:
         config_options = result.get("configOptions")
         if isinstance(config_options, list):
             self.session_config_options = config_options
+        self._capture_modes(result)
         return result
 
     def cancel(self, session_id: str) -> None:

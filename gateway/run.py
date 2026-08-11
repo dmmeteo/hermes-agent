@@ -3768,6 +3768,114 @@ def _reconnect_backoff(attempt: int) -> int:
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
 
 
+def _turn_runtime_metadata(agent, result: dict) -> dict:
+    """The runtime facts one finished turn reports about itself.
+
+    Returns ``{"model", "model_id", "context_length", "last_prompt_tokens",
+    "transcript_prompt_tokens", "input_tokens", "output_tokens"}`` — the keys
+    ``TurnRunner.run_sync`` stamps into both of its result dicts, and from there
+    the runtime footer, the ``agent:end`` hook payload and the session entry's
+    context-window tracking.
+
+    A module-level function on purpose: ``run_sync`` is ~1300 lines and cannot
+    be driven from a unit test, so the four lines this replaces were the one
+    part of the gateway's metadata path with no test seam at all — which is how
+    they came to be the only surface still reading the agent object where the
+    CLI status bar, ``/usage``, ``/context`` and the TUI's ``session.info``
+    read the runtime seam.
+
+    Resolution is most-specific-first, each step falling through on absence, so
+    that every non-ACP agent gets exactly what the four lines got:
+
+    * ``model`` — the display label (``gateway.model_identity``), which *is*
+      ``agent.model`` for every provider that has not captured a separate live
+      identity. ``model_id`` is the same question asked for machines: it stays
+      an id, because it is what an id-keyed table would be looked up by.
+    * ``context_length`` — the window the adapter reported for this turn, else
+      the compressor's. Only the Claude Code ACP runtime returns
+      ``context_window_tokens``, so nothing else moves.
+    * ``last_prompt_tokens`` — the adapter's own occupancy figure
+      (``context_used_tokens``: how full Claude Code says its window is, the
+      number its own ``/context`` shows) when it reported one, else the
+      compressor's reading, else the turn's reported prompt tokens. The name is
+      the gateway's existing contract and its consumer is a ``used / window``
+      percentage, which is exactly what occupancy answers; the fallback order
+      keeps the compressor authoritative wherever it *has* a reading, including
+      its ``-1`` "unknown until the next real reading" sentinel, so the Codex
+      app-server runtime — which drives the compressor *and* returns
+      ``last_prompt_tokens`` — is unaffected.
+    * ``transcript_prompt_tokens`` — the compressor's reading alone, i.e. what
+      ``last_prompt_tokens`` meant before a delegated runtime could answer the
+      occupancy question. Identical to ``last_prompt_tokens`` on every runtime
+      that drives the compressor, and the two diverge only where the numbers
+      genuinely mean different things: "how full is *Claude Code's* window"
+      (a fact to display) is not "how large is *Hermes'* transcript" (the input
+      the session-hygiene auto-compression heuristic sizes its history with).
+      The session entry stores this one for that reason.
+
+    Hermes' compressor is deliberately not driven on the Claude Code runtime
+    (Claude Code owns and compacts its own window; feeding it would rewrite
+    Hermes' past context to solve a problem on the other side of the boundary),
+    which is why that runtime's ``0`` used against a non-zero window rendered
+    as a real-looking ``0%``.
+    """
+    result = result or {}
+    meta = {
+        "model": None,
+        "model_id": None,
+        "context_length": 0,
+        "last_prompt_tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
+    if not agent:
+        return meta
+
+    from gateway.model_identity import display_model_for, metadata_model_for
+
+    # ``or getattr(...)`` so an agent with no usable model reports exactly what
+    # it reported before this function existed (``None``), rather than "".
+    _agent_model = getattr(agent, "model", None)
+    meta["model"] = display_model_for(agent) or _agent_model
+    meta["model_id"] = metadata_model_for(agent) or _agent_model
+
+    _compressor_used = 0
+    if hasattr(agent, "context_compressor"):
+        _compressor = agent.context_compressor
+        _compressor_used = getattr(_compressor, "last_prompt_tokens", 0)
+        meta["input_tokens"] = getattr(agent, "session_prompt_tokens", 0)
+        meta["output_tokens"] = getattr(agent, "session_completion_tokens", 0)
+        meta["context_length"] = getattr(_compressor, "context_length", 0) or 0
+        meta["last_prompt_tokens"] = _compressor_used
+
+    _window = _coerce_reported_tokens(result.get("context_window_tokens"))
+    if _window is not None:
+        meta["context_length"] = _window
+
+    # What Hermes measured about its OWN transcript, kept separate from what
+    # the delegated runtime says about ITS window — see the key's note above.
+    meta["transcript_prompt_tokens"] = meta["last_prompt_tokens"]
+
+    _used = _coerce_reported_tokens(result.get("context_used_tokens"))
+    if _used is None and not _compressor_used:
+        _used = _coerce_reported_tokens(result.get("last_prompt_tokens"))
+    if _used is not None:
+        meta["last_prompt_tokens"] = _used
+
+    return meta
+
+
+def _coerce_reported_tokens(value) -> Optional[int]:
+    """A non-negative token count a runtime reported, or ``None``.
+
+    Anything else — absent, wrong type, negative — falls through to the next
+    source rather than becoming a number on someone's footer.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
+
+
 class TurnRunner:
     """Per-turn collaborator carrying the tool-progress callbacks that used to
     be nested closures inside ``GatewayRunner._run_agent_inner``.
@@ -5620,18 +5728,11 @@ class TurnRunner:
         # Return final response, or a message if something went wrong
         final_response = result.get("final_response")
 
-        # Extract actual token counts from the agent instance used for this run
-        _last_prompt_toks = 0
-        _input_toks = 0
-        _output_toks = 0
-        _context_length = 0
+        # The runtime facts this turn reports about itself — token counts off
+        # the agent, plus anything the runtime itself reported that is more
+        # authoritative than the agent object (see _turn_runtime_metadata).
         _agent = ctx.agent_holder[0]
-        if _agent and hasattr(_agent, "context_compressor"):
-            _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
-            _input_toks = getattr(_agent, "session_prompt_tokens", 0)
-            _output_toks = getattr(_agent, "session_completion_tokens", 0)
-            _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
-        _resolved_model = getattr(_agent, "model", None) if _agent else None
+        _runtime_meta = _turn_runtime_metadata(_agent, result)
 
         # Sync session_id immediately after run_conversation(). Compression
         # can rotate before a follow-up model call fails; the failure return
@@ -5763,11 +5864,7 @@ class TurnRunner:
                 "history_offset": _effective_history_offset,
                 "compacted_in_place": _compacted_in_place,
                 "session_id": effective_session_id,
-                "last_prompt_tokens": _last_prompt_toks,
-                "input_tokens": _input_toks,
-                "output_tokens": _output_toks,
-                "model": _resolved_model,
-                "context_length": _context_length,
+                **_runtime_meta,
             }
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -5840,11 +5937,7 @@ class TurnRunner:
             "tools": ctx.tools_holder[0] or [],
             "history_offset": _effective_history_offset,
             "compacted_in_place": _compacted_in_place,
-            "last_prompt_tokens": _last_prompt_toks,
-            "input_tokens": _input_toks,
-            "output_tokens": _output_toks,
-            "model": _resolved_model,
-            "context_length": _context_length,
+            **_runtime_meta,
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
@@ -18285,11 +18378,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
 
-            # Emit agent:end hook
+            # Emit agent:end hook.  ``model_id`` rather than ``model``: hook
+            # handlers key, log and correlate on this, so it stays the id-shaped
+            # value it has always been rather than becoming the footer's display
+            # label (they differ only on the Claude Code ACP runtime — see
+            # _turn_runtime_metadata).
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
                 "response": (response or "")[:500],
-                "model": agent_result.get("model", ""),
+                "model": agent_result.get("model_id") or agent_result.get("model", ""),
                 "provider": agent_result.get("provider", ""),
             })
             
@@ -18587,10 +18684,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             
             # Token counts and model are now persisted by the agent directly.
             # Keep only last_prompt_tokens here for context-window tracking and
-            # compression decisions.
+            # compression decisions.  Deliberately the transcript reading rather
+            # than the footer's occupancy figure: session hygiene sizes THIS
+            # session's history with it, and a delegated runtime's window
+            # occupancy (which counts tool traffic Hermes never stored) is not a
+            # measurement of that history.  The two are the same number on every
+            # runtime that drives the compressor — see _turn_runtime_metadata.
             await self.async_session_store.update_session(
                 session_entry.session_key,
-                last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+                last_prompt_tokens=agent_result.get(
+                    "transcript_prompt_tokens",
+                    agent_result.get("last_prompt_tokens", 0),
+                ),
             )
 
             # Re-baseline the cached agent's message_count snapshot now that

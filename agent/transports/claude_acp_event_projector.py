@@ -20,6 +20,15 @@ Event map (ACP ``sessionUpdate`` discriminator → projection):
   usage_update           → ``usage``         (context occupancy + cost)
   everything else        → ``ignored``
 
+Alongside those per-event projections the projector accumulates the turn's tool
+activity as canonical **transcript rows** (``projected_messages``, Packet 5
+slice D): one ``{role: "assistant", content: None, tool_calls: [...]}`` /
+``{role: "tool", tool_call_id, content}`` pair per completed tool call, the
+shape ``agent/transports/codex_event_projector.py`` already produces and
+``agent/curator.py`` / ``session_search`` / a later native-model turn already
+read. Display and persistence stay two disjoint consumers of one projector: a
+row fires no callback and a callback writes no row.
+
 Two rules make the "no raw payload in the reply" invariant structural rather
 than incidental:
 
@@ -55,11 +64,15 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ClaudeAcpEventProjector",
     "MODEL_CONFIG_OPTION_ID",
+    "PERSISTED_RESULT_MAX_CHARS",
     "PermissionRequest",
     "ProjectedEvent",
     "ToolActivity",
+    "UNREPORTED_TOOL_RESULT",
     "UsageSnapshot",
     "deterministic_call_id",
+    "extract_available_mode_ids",
+    "extract_current_mode_id",
     "extract_current_model_id",
     "extract_model_options",
     "has_model_config_option",
@@ -191,6 +204,55 @@ def extract_model_options(config_options: Any) -> List[Dict[str, str]]:
     return out
 
 
+def extract_current_mode_id(modes: Any) -> Optional[str]:
+    """The permission mode a ``modes`` block reports as current, or ``None``.
+
+    *modes* is the raw ``SessionModeState`` ACP carries on ``session/new``'s and
+    ``session/load``'s responses (``{currentModeId, availableModes}``; adapter
+    0.66.0's ``createSession`` always sends one). Unlike the model, the mode has
+    a dedicated ACP field and a dedicated change notification
+    (``current_mode_update``) — so this reads a real protocol shape rather than
+    the generic ``configOptions`` list, which also carries a "mode" entry the
+    adapter leaves inert.
+
+    ``None`` for anything that is not a well-formed answer, which is the fact a
+    caller needs: a response that says nothing about modes must not be read as
+    one that says the session has none (see :func:`extract_available_mode_ids`).
+    """
+    if not isinstance(modes, dict):
+        return None
+    value = modes.get("currentModeId")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def extract_available_mode_ids(modes: Any) -> List[str]:
+    """Every permission mode a ``modes`` block advertises, in the agent's order.
+
+    Reads ``availableModes[].id``. Returns ``[]`` for a block that advertises
+    none *and* for one that is malformed — the caller distinguishes "no block at
+    all" from "an empty block" by whether the response carried ``modes``, not by
+    this list (``ClaudeAcpClient.available_mode_ids`` is where that split lives).
+    """
+    if not isinstance(modes, dict):
+        return []
+    raw = modes.get("availableModes")
+    if not isinstance(raw, list):
+        return []
+    out: List[str] = []
+    for entry in raw:
+        mode_id: Any = None
+        if isinstance(entry, dict):
+            mode_id = entry.get("id")
+        elif isinstance(entry, str):
+            mode_id = entry
+        if not isinstance(mode_id, str) or not mode_id.strip():
+            continue
+        mode_id = mode_id.strip()
+        if mode_id not in out:
+            out.append(mode_id)
+    return out
+
+
 # Display bounds. A single tool result can be a whole file; a messaging
 # platform must not receive it, and neither must a progress bubble.
 _MAX_RESULT_CHARS = 4000
@@ -201,6 +263,30 @@ _MAX_SCRUB_DEPTH = 6
 #: How many declared tool locations an approval prompt may name. A tool that
 #: touches 400 files must not turn the prompt into a wall of paths.
 _MAX_LOCATIONS = 8
+
+#: Bound on a tool result *as persisted in a transcript row*. A chatty Claude
+#: Code turn can produce dozens of these into a session DB that is already
+#: hundreds of megabytes, and a single result can be a whole file. Deliberately
+#: its own constant rather than a reuse of the display bound: a display bubble
+#: is thrown away, so cutting it with a bare ellipsis costs nothing, while a
+#: transcript row is read later by the curator, by ``session_search`` and
+#: possibly by a real API call — and a reader who cannot tell a complete result
+#: from a truncated one has been told the wrong thing. The byte-exact output
+#: always remains in Claude Code's own transcript, whose uuid is persisted on
+#: the Hermes session (``agent/claude_acp_binding.py``).
+PERSISTED_RESULT_MAX_CHARS = 4000
+
+#: What a persisted row says for a tool call the adapter never reported an
+#: outcome for — the turn was cancelled, errored, or stopped mid-tool. The row
+#: exists rather than being dropped because an assistant ``tool_calls`` row with
+#: no matching ``tool`` row is what breaks ``repair_message_sequence`` and what
+#: a later native-model turn on the same session would send to a real API.
+UNREPORTED_TOOL_RESULT = "[no result recorded: turn ended before the tool reported]"
+
+#: Marks a failed tool in its transcript row. The display surface carries
+#: ``is_error`` as structured data; a row has only its text, and "the tool ran
+#: and returned this" reads as success without it.
+_FAILED_RESULT_PREFIX = "[failed]"
 
 
 def deterministic_call_id(tool_call_id: str) -> str:
@@ -282,8 +368,13 @@ def _content_text(blocks: Any) -> str:
     return "\n".join(part for part in parts if part)
 
 
-def _result_text(payload: Dict[str, Any]) -> str:
-    """Scrubbed, bounded outcome text for a finished tool call."""
+def _scrubbed_result_text(payload: Dict[str, Any]) -> str:
+    """Scrubbed — but NOT yet bounded — outcome text for a finished tool call.
+
+    Unbounded because the display surface and the transcript row want different
+    bounds, and scrubbing has to happen once, before either cut: truncating
+    first can split a secret into a prefix the redactor no longer recognises.
+    """
     raw_output = payload.get("rawOutput")
     if isinstance(raw_output, str):
         text = raw_output
@@ -294,7 +385,70 @@ def _result_text(payload: Dict[str, Any]) -> str:
             text = repr(raw_output)
     else:
         text = _content_text(payload.get("content"))
-    return _truncate(_scrub_text(text), _MAX_RESULT_CHARS)
+    return _scrub_text(text)
+
+
+def _result_text(payload: Dict[str, Any]) -> str:
+    """Scrubbed, display-bounded outcome text for a finished tool call."""
+    return _truncate(_scrubbed_result_text(payload), _MAX_RESULT_CHARS)
+
+
+def _persisted_result_text(text: str) -> str:
+    """Bound *text* for a transcript row, naming what was left out.
+
+    Unlike :func:`_truncate`, the marker carries a count: a reader who sees one
+    knows both that the result is partial and how much of it is missing, and can
+    go to Claude Code's own transcript for the rest.
+    """
+    if len(text) <= PERSISTED_RESULT_MAX_CHARS:
+        return text
+    omitted = len(text) - PERSISTED_RESULT_MAX_CHARS
+    return (
+        text[:PERSISTED_RESULT_MAX_CHARS] + f"… [+{omitted} chars truncated]"
+    )
+
+
+def _transcript_pair(
+    activity: "ToolActivity", result: str
+) -> List[Dict[str, Any]]:
+    """One tool call as the canonical ``(assistant tool_calls, tool)`` pair.
+
+    The shape is ``codex_event_projector``'s, verbatim, because the readers are
+    the same: ``agent/curator.py``, external-memory review, background-review
+    snapshots, ``session_search``, and — if this session is ever switched to a
+    native model — a real OpenAI-shaped API call.
+
+    ``activity.args`` is already scrubbed and per-value bounded (``_scrub_value``
+    caps every string at ``_MAX_ARG_CHARS``), so the arguments carried here are
+    the same masked values the tool bubble showed. The tool is named exactly as
+    the adapter named it (``Bash``, ``Write``) — honestly not-a-Hermes-tool, and
+    the same name its approval prompt already used.
+    """
+    try:
+        arguments = json.dumps(activity.args, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):  # pragma: no cover - args are scrubbed JSON
+        arguments = "{}"
+    return [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": activity.call_id,
+                "type": "function",
+                "function": {"name": activity.name, "arguments": arguments},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": activity.call_id,
+            # Both spellings, matching what Hermes' own tool loop writes
+            # (`agent/tool_dispatch_helpers.py`): `name` is the wire field,
+            # `tool_name` is the SessionDB column.
+            "name": activity.name,
+            "tool_name": activity.name,
+            "content": result,
+        },
+    ]
 
 
 def _declared_tool_name(payload: Dict[str, Any]) -> str:
@@ -621,6 +775,12 @@ class ProjectedEvent:
     #: display surface of its own (see ``claude_code_runtime.py``'s event
     #: bridge), it exists so ``ClaudeAcpSession`` can keep its identity current.
     model_id: str = ""
+    #: Set only for ``kind == "mode_changed"`` — the permission mode a
+    #: ``current_mode_update`` just reported (Packet 5 slice A). State capture
+    #: only, for exactly the reasons ``model_id`` is: the posture is a config
+    #: decision and a mid-session change is a fact the session records, never a
+    #: chat bubble.
+    mode_id: str = ""
 
 
 _IGNORED = ProjectedEvent(kind="ignored")
@@ -642,6 +802,14 @@ class ClaudeAcpEventProjector:
         #: name, never a kind fallback — a permission prompt asking about the
         #: wrong tool is worse than one that names the kind honestly.
         self._declared_names: Dict[str, str] = {}
+        #: Transcript rows for the tool calls that reached a terminal update, in
+        #: completion order (Packet 5 slice D). Written on outcomes only, never
+        #: per progress event — a status change is not a thing that happened.
+        self._transcript_rows: List[Dict[str, Any]] = []
+        #: ``toolCallId``s already represented in :attr:`_transcript_rows`, so
+        #: the orphan repair in :meth:`projected_messages` can tell an
+        #: unfinished call from a finished one.
+        self._recorded_calls: set = set()
         self.tool_iterations = 0
         self.usage: Optional[UsageSnapshot] = None
         #: Last model id a ``config_option_update`` reported during THIS turn,
@@ -649,6 +817,10 @@ class ClaudeAcpEventProjector:
         #: identity ACROSS turns — a fresh projector starting at ``None`` here
         #: just means "no change was reported this turn", not "no model known".
         self.model_id: Optional[str] = None
+        #: Last permission mode a ``current_mode_update`` reported during THIS
+        #: turn, on the same terms as :attr:`model_id`: per-turn, and the
+        #: session is what carries the posture across turns.
+        self.mode_id: Optional[str] = None
 
     # ---------- accumulated turn state ----------
 
@@ -656,6 +828,29 @@ class ClaudeAcpEventProjector:
     def assistant_text(self) -> str:
         """The reply, assembled from assistant text chunks only."""
         return "".join(self._text_parts)
+
+    @property
+    def projected_messages(self) -> List[Dict[str, Any]]:
+        """This turn's tool activity as canonical transcript rows.
+
+        One ``(assistant tool_calls, tool)`` pair per tool call, in completion
+        order, with every call that never reached a terminal update repaired at
+        the end (:data:`UNREPORTED_TOOL_RESULT`). The repair is computed on read
+        rather than flushed by a caller, so there is no "someone forgot to call
+        flush" failure mode: **every** exit path — success, a non-``end_turn``
+        stop reason, a cancel mid-tool — reads a list with no orphan
+        ``tool_calls`` row in it, and reading twice gives the same list.
+
+        Fires no callback and touches no display surface. The runtime splices
+        this into ``messages`` once, at turn end
+        (``agent/claude_code_runtime.py``); the event sink never sees it.
+        """
+        rows = list(self._transcript_rows)
+        for call_id, activity in self._tools.items():
+            if call_id in self._recorded_calls:
+                continue
+            rows.extend(_transcript_pair(activity, UNREPORTED_TOOL_RESULT))
+        return rows
 
     def declared_tool_name(self, tool_call_id: str) -> str:
         """The tool name the adapter declared for ``tool_call_id``, or ``""``.
@@ -686,11 +881,13 @@ class ClaudeAcpEventProjector:
             return self._project_usage(update)
         if kind == "config_option_update":
             return self._project_config_option_update(update)
+        if kind == "current_mode_update":
+            return self._project_current_mode_update(update)
         # Deliberately ignored, and deliberately the default: user_message_chunk
         # (our own prompt echoed back, or history a session/load replayed),
         # plan/plan_update, available_commands_update, session_info_update,
-        # current_mode_update, and anything a future adapter version adds.
-        # None of it is the assistant's reply.
+        # and anything a future adapter version adds. None of it is the
+        # assistant's reply.
         return _IGNORED
 
     # ---------- per-kind ----------
@@ -815,12 +1012,32 @@ class ClaudeAcpEventProjector:
         return ProjectedEvent(kind="tool_updated", tool=activity)
 
     def _finish(self, activity: ToolActivity, payload: Dict[str, Any]) -> ProjectedEvent:
-        activity.result = _result_text(payload)
+        scrubbed = _scrubbed_result_text(payload)
+        activity.result = _truncate(scrubbed, _MAX_RESULT_CHARS)
         activity.is_error = activity.status == "failed"
         activity.duration = max(self._clock() - activity.started_at, 0.0)
         # One tick per completed tool call, mirroring the chat-completions
         # loop's per-iteration tick that this delegated path bypasses.
         self.tool_iterations += 1
+        # ...and one transcript pair per completed tool call, from the SAME
+        # event, so the row count and the iteration count can never disagree
+        # about how many tools ran. Bounded from the unbounded scrubbed text
+        # rather than from `activity.result`, whose bare-ellipsis display cut
+        # carries no count of what it dropped.
+        call_id = str(payload.get("toolCallId") or "")
+        if call_id not in self._recorded_calls:
+            # First outcome wins. A second terminal update for the same call
+            # (`completed` then `failed`) is not something adapter 0.66.0 sends,
+            # but if one arrived, appending a second pair would put two rows in
+            # the transcript under one `tool_call_id` — and a pair matched by id
+            # is exactly what `repair_message_sequence` and a later native-model
+            # turn rely on. The display event below is unchanged: what a surface
+            # does with a second completion is its own existing behaviour.
+            persisted = _persisted_result_text(scrubbed)
+            if activity.is_error:
+                persisted = f"{_FAILED_RESULT_PREFIX} {persisted}".strip()
+            self._recorded_calls.add(call_id)
+            self._transcript_rows.extend(_transcript_pair(activity, persisted))
         return ProjectedEvent(kind="tool_completed", tool=activity)
 
     def _project_usage(self, payload: Dict[str, Any]) -> ProjectedEvent:
@@ -867,6 +1084,27 @@ class ClaudeAcpEventProjector:
             return _IGNORED
         self.model_id = model_id
         return ProjectedEvent(kind="model_changed", model_id=model_id)
+
+    def _project_current_mode_update(self, payload: Dict[str, Any]) -> ProjectedEvent:
+        """State capture only (Packet 5 slice A) — never a display event.
+
+        The permission posture can move mid-session: the user changes it inside
+        Claude Code, or the adapter drops out of a mode it cannot sustain. ACP
+        announces that with its own notification kind rather than through
+        ``config_option_update``, so this is a separate handler with the same
+        discipline — deduped within a turn, no display surface, and read back by
+        ``ClaudeAcpSession`` so ``effective_permission_mode`` describes what is
+        actually in force rather than what Hermes last asked for.
+
+        Deliberately does NOT re-negotiate. A mode Hermes did not request is a
+        fact to record; answering it with another ``set_mode`` would fight the
+        user's own live change, mid-turn, on the turn thread.
+        """
+        mode_id = extract_current_mode_id(payload)
+        if not mode_id or mode_id == self.mode_id:
+            return _IGNORED
+        self.mode_id = mode_id
+        return ProjectedEvent(kind="mode_changed", mode_id=mode_id)
 
 
 def _coerce_int(value: Any) -> int:

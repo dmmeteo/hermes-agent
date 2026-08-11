@@ -22,13 +22,20 @@ What this adds over Packet 1's per-turn adapter:
   ``should_retire`` discipline the codex runtime already uses). Idle sessions
   are evicted the same way.
 
-Security posture from Packet 1 is unchanged and re-applied on every rebind:
-``session/set_mode`` → ``default`` before any prompt, so the adapter's
-self-approving ``auto`` classifier never decides anything. What Packet 3B
-changes is what happens to the request that mode produces: instead of a blanket
+Security posture from Packet 1 is re-applied on every rebind: a
+``session/set_mode`` before any prompt, so the adapter's self-approving ``auto``
+classifier does not silently decide things Hermes was meant to gate. Packet 5
+slice A makes *which* mode that is a profile decision
+(``model.claude_code_acp.permission_mode``, policy in
+``agent/claude_acp_permissions.py``) with ``default`` — today's behaviour — as
+the default, an enumerated opt-in for the self-approving modes, and ``inherit``
+for "send nothing and leave the adapter's own settings in force". What Packet 3B
+changes is what happens to the request a mode produces: instead of a blanket
 denial, it is offered to a ``permission_handler`` the runtime supplies (Hermes'
 own approval flow). Deny remains the default on every path where that handler is
-absent, unusable, or unsuccessful — see ``_decide_permission``.
+absent, unusable, or unsuccessful — see ``_decide_permission``. That gate is
+mode-independent: the mode changes how many requests exist, never what happens
+to one.
 """
 
 from __future__ import annotations
@@ -37,7 +44,7 @@ import atexit
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from agent.claude_acp_binding import BindingStore, TurnLease
@@ -61,9 +68,12 @@ TURN_TIMEOUT_SECONDS = 900.0
 #: binding survives eviction, so the next turn rebinds transparently.
 IDLE_TTL_SECONDS = 1800.0
 
-#: Permission mode Hermes negotiates for every session. NOT the adapter's
-#: default (``auto``), which self-approves via a classifier.
-PERMISSION_MODE = "default"
+#: Permission mode Hermes negotiates when the profile configured none. NOT the
+#: adapter's own default (``auto``), which self-approves via a classifier. The
+#: policy that turns a profile's configured value into the mode actually sent
+#: lives in ``agent/claude_acp_permissions.py``; this constant is only the
+#: fallback both ends agree on.
+DEFAULT_PERMISSION_MODE = "default"
 
 #: Live sessions, keyed by Hermes session id (or by object identity when the
 #: agent has no session id). The registry is what makes "exactly one adapter
@@ -102,6 +112,13 @@ class AcpTurnOutcome:
     #: Completed tool calls the adapter reported, for the skill-nudge counter
     #: the chat-completions loop ticks per tool iteration.
     tool_iterations: int = 0
+    #: This turn's tool activity as canonical ``(assistant tool_calls, tool)``
+    #: transcript rows (Packet 5 slice D) — the projector's
+    #: ``projected_messages``, read once at turn end. Already orphan-repaired,
+    #: so a cancelled or errored turn carries closed pairs rather than an
+    #: assistant ``tool_calls`` row with nothing answering it. The runtime
+    #: splices these into ``messages``; nothing here is a display surface.
+    projected_messages: List[Dict[str, Any]] = field(default_factory=list)
     #: The ``usage`` block on the ``session/prompt`` reply — ACP's authoritative
     #: per-turn token counts. ``None`` when the agent reported none.
     usage: Optional[Dict[str, Any]] = None
@@ -115,6 +132,11 @@ class AcpTurnOutcome:
     #: the SDK's own refusal fallback). ``None`` when no adapter this runtime
     #: has talked to has ever reported one.
     model_id: Optional[str] = None
+    #: The permission mode in force as of the end of this turn (Packet 5 slice
+    #: A) — the negotiated one, or what the adapter itself was running under
+    #: ``inherit``, kept current by any ``current_mode_update`` the turn saw.
+    #: ``None`` when the session reported none.
+    permission_mode: Optional[str] = None
 
 
 @dataclass
@@ -185,12 +207,18 @@ class ClaudeAcpSession:
         store: Optional[BindingStore] = None,
         hermes_session_id: str = "",
         additional_directories: Optional[List[str]] = None,
+        permission_mode: str = DEFAULT_PERMISSION_MODE,
     ) -> None:
         self.argv = list(argv)
         self.cwd = cwd
         #: Extra roots the user explicitly allowed, already validated by
         #: ``agent/claude_acp_workspace.py``. Empty means "the workspace only".
         self.additional_directories = list(additional_directories or [])
+        #: The posture the profile asked for, verbatim — including ``inherit``,
+        #: which is not a mode. What is actually negotiated depends on what the
+        #: live session advertises and is resolved per connect; see
+        #: :attr:`negotiated_permission_mode`.
+        self.permission_mode = permission_mode or DEFAULT_PERMISSION_MODE
         self.key = hermes_session_id or f"anon-{id(self):x}"
         self._store = store if store is not None else BindingStore()
         self._client: Optional[Any] = None
@@ -221,6 +249,31 @@ class ClaudeAcpSession:
         #: move the conversation (and its billing route) to another provider.
         self._remembered_model_id: Optional[str] = None
         self._remembered_model_options: List[Dict[str, str]] = []
+        #: What the last ``_connect()`` resolved and actually sent (Packet 5
+        #: slice A). ``None`` before the first connect AND for the ``inherit``
+        #: posture, where nothing is sent — the two are told apart by
+        #: :attr:`effective_permission_mode`, which is populated off the wire in
+        #: the second case and not in the first.
+        self._negotiated_mode_id: Optional[str] = None
+        #: The mode the LIVE adapter last reported: seeded from ``session/new``
+        #: / ``session/load``'s ``modes.currentModeId``, replaced by the mode a
+        #: successful negotiation put in force, and kept current by any
+        #: ``current_mode_update`` a turn observes. Dropped with the adapter
+        #: that reported it — it describes a running process, not a policy.
+        self._current_mode_id: Optional[str] = None
+        #: The last context occupancy the LIVE adapter reported (Packet 5 slice
+        #: B). ``usage_update`` arrives on a per-turn projector, but how full
+        #: the window is, is a standing fact about the *session*: an adapter
+        #: states it when it changes, not once per turn. Without this a quiet
+        #: turn would report no occupancy and any display of it would flicker.
+        #: Dropped with the adapter that reported it — a retired process's
+        #: occupancy describes a window nothing is holding open any more.
+        self._last_context_usage: Optional["UsageSnapshot"] = None
+        #: What the last connect's skills bridge did (Packet 5 slice C).
+        #: ``None`` before the first connect and whenever the bridge is off —
+        #: kept purely for introspection (`hermes doctor`, tests, a future
+        #: status surface); nothing in the turn path reads it.
+        self.last_skill_bridge_result: Optional[Any] = None
         _register(self)
 
     # ---------- introspection ----------
@@ -288,6 +341,31 @@ class ClaudeAcpSession:
         See :attr:`remembered_model_id`.
         """
         return [dict(option) for option in self._remembered_model_options]
+
+    @property
+    def negotiated_permission_mode(self) -> Optional[str]:
+        """The mode Hermes actually sent on the last connect, or ``None``.
+
+        ``None`` means no ``session/set_mode`` went out: either the profile
+        chose ``inherit``, or this session has not connected yet. It is Hermes'
+        own decision, resolved from config against what the session advertised —
+        not necessarily what the adapter is running now (see
+        :attr:`effective_permission_mode`).
+        """
+        return self._negotiated_mode_id
+
+    @property
+    def effective_permission_mode(self) -> Optional[str]:
+        """The mode actually in force, as best the wire has stated it.
+
+        Prefers what the adapter reported — ``modes.currentModeId`` at connect,
+        the mode a successful negotiation put in force, and any later
+        ``current_mode_update`` — over what Hermes asked for, because those can
+        differ: under ``inherit`` Hermes asks for nothing, and a user changing
+        the mode inside Claude Code mid-session moves it out from under any
+        earlier negotiation. ``None`` when no adapter has ever reported one.
+        """
+        return self._current_mode_id or self._negotiated_mode_id
 
     @property
     def turn_in_flight(self) -> bool:
@@ -455,17 +533,26 @@ class ClaudeAcpSession:
         argv: List[str],
         cwd: str,
         additional_directories: Optional[List[str]] = None,
+        permission_mode: str = DEFAULT_PERMISSION_MODE,
     ) -> bool:
         """Whether a live session is still the right one for these settings.
 
         The roots are part of the answer: they are negotiated on the wire at
         session creation, so a changed root list means the running adapter is
         scoped to something other than what the caller now wants.
+
+        So is the permission mode, for the same reason: the live adapter has
+        already been put into a posture, and a profile that changed the key
+        expects the change to take effect rather than to be silently deferred
+        until the adapter happens to be replaced. Rebuilding is what makes the
+        config the source of truth; the posture is exactly the setting where
+        "eventually" is the wrong answer.
         """
         return (
             self.argv == list(argv)
             and self.cwd == cwd
             and self.additional_directories == list(additional_directories or [])
+            and self.permission_mode == (permission_mode or DEFAULT_PERMISSION_MODE)
         )
 
     # ---------- cancellation ----------
@@ -522,6 +609,15 @@ class ClaudeAcpSession:
         self._remember_model_state()
         self._current_model_id = None
         self._model_options = []
+        # The mode described the process being retired, and nothing may report
+        # a posture that no adapter is in. The next connect re-seeds it from
+        # whatever answers, and re-negotiates from config.
+        self._current_mode_id = None
+        self._negotiated_mode_id = None
+        # Same argument for the occupancy, and no "remembered" twin: a model
+        # name is worth recognising after its adapter is gone, a stale
+        # percentage of a window nobody is holding open is worth nothing.
+        self._last_context_usage = None
         if client is None:
             return
         try:
@@ -556,6 +652,21 @@ class ClaudeAcpSession:
         self._drop_client()
 
         from agent.transports.claude_acp import ClaudeAcpClient
+
+        # Packet 5 slice C: the adapter's Claude Code session scans
+        # `<its config dir>/skills` while `session/new` / `session/load` is being
+        # answered — settled against the pinned adapter (`createSession` awaits
+        # `initializationResult()` inside both) and confirmed by a live probe: a
+        # skill added after the session exists is never picked up, and a second
+        # `session/new` on the same process is. So the links have to be on disk
+        # before the session call, on every connect, which also makes them
+        # self-healing. Materialized before the spawn rather than merely before
+        # the call, so an adapter that ever moved the scan to startup would still
+        # see them. Fail-open by construction: `bridge_skills` never raises, and
+        # `None` means the profile never turned the bridge on.
+        from agent.claude_acp_skills import bridge_skills
+
+        self.last_skill_bridge_result = bridge_skills()
 
         client = ClaudeAcpClient(command=self.argv, cwd=self.cwd)
         with self._lock:
@@ -631,14 +742,67 @@ class ClaudeAcpSession:
         # (slice A) and the models this session offers (slice B).
         self._capture_model_state(client)
 
-        # SECURITY: the adapter starts in `auto`, where a classifier approves
-        # writes and shell commands without ever asking Hermes. Move it to
-        # `default` before any prompt runs — on every new session AND every
-        # rebind, since the mode is session state the adapter re-derives.
-        client.set_mode(self._acp_session_id, PERMISSION_MODE)
+        # Packet 5 slice A: whichever call just ran also carried the session's
+        # `modes` block, so the posture is negotiated against what THIS session
+        # advertises rather than against a list a previous adapter gave.
+        self._capture_mode_state(client)
+        self._negotiate_permission_mode(client)
         self._store.bind(self._acp_session_id, self.cwd)
         turn.session_id = self._acp_session_id
         return reseeded
+
+    def _capture_mode_state(self, client: Any) -> None:
+        """Re-seed the live permission-mode state from a connected *client*.
+
+        Unconditional, exactly like :meth:`_capture_model_state`: a rebind can
+        land on a different adapter build, so what the previous one advertised
+        is not evidence about this one, and a response carrying no ``modes``
+        block reads as "this session reports no mode state" rather than "keep
+        what you had". Carrying it over would let a configured mode be validated
+        against a list the live session never gave — which is the whole point of
+        validating.
+        """
+        self._current_mode_id = client.current_mode_id
+
+    def _negotiate_permission_mode(self, client: Any) -> None:
+        """Put this session into the posture the profile configured.
+
+        SECURITY: the adapter starts in ``auto``, where a classifier approves
+        writes and shell commands without ever asking Hermes. Unless the profile
+        explicitly asked for a self-approving mode or for ``inherit``, the
+        session is moved to ``default`` before any prompt runs — on every new
+        session AND every rebind, since the mode is session state the adapter
+        re-derives.
+
+        A refusal from the adapter is deliberately allowed to propagate: it
+        aborts the connect, so a turn never runs on a session whose posture is
+        not the one that was asked for. Failing open here would be the exact
+        silent-``auto`` regression Packet 3's acceptance check exists to catch.
+        """
+        from agent.claude_acp_permissions import (
+            SELF_APPROVING_MODES,
+            describe_posture,
+            resolve_permission_mode,
+        )
+
+        negotiated = resolve_permission_mode(
+            self.permission_mode, client.available_mode_ids
+        )
+        self._negotiated_mode_id = negotiated
+        if negotiated is None:
+            # `inherit`: nothing is sent, and what the adapter derived from its
+            # own settings (captured above) stands.
+            logger.warning(describe_posture(None, self.permission_mode))
+            return
+        client.set_mode(self._acp_session_id, negotiated)
+        # The negotiation succeeded, so this is now the mode in force —
+        # `modes.currentModeId` described the session before we moved it.
+        self._current_mode_id = negotiated
+        if negotiated in SELF_APPROVING_MODES:
+            # One line per connect, naming the mode: a posture that removes most
+            # of Hermes' visibility must be legible in the log of the run it
+            # applied to, not only in a config file.
+            logger.warning(describe_posture(negotiated, self.permission_mode))
 
     def _negotiable_roots(self, client: Any) -> List[str]:
         """The extra roots this agent will actually accept on the wire."""
@@ -776,7 +940,24 @@ class ClaudeAcpSession:
             outcome.text = projector.assistant_text
             outcome.stop_reason = result.get("stopReason")
             outcome.tool_iterations = projector.tool_iterations
-            outcome.context_usage = projector.usage
+            # Read once, after the prompt settled — including a settle that came
+            # from a cancel, where the adapter reports no outcome for whatever
+            # tool was still running. The projector closes those pairs itself
+            # (`projected_messages`), so there is nothing for this call site to
+            # get wrong on a stop path.
+            outcome.projected_messages = projector.projected_messages
+            # Occupancy is a standing fact about the window; cost is an event.
+            # A turn that reported neither still knows how full the window is
+            # (nothing it did could have shrunk it), but re-reporting the
+            # earlier turn's cost would invent spend that never happened — so
+            # what carries forward is the snapshot with its cost stripped.
+            if projector.usage is not None:
+                self._last_context_usage = replace(
+                    projector.usage, cost_amount=None, cost_currency="",
+                )
+                outcome.context_usage = projector.usage
+            else:
+                outcome.context_usage = self._last_context_usage
             # A config_option_update seen THIS turn (a user-driven switch, or —
             # just as often — the SDK's own unprompted refusal fallback) is the
             # freshest signal; absent one, the identity connect-time seeded (or
@@ -784,6 +965,13 @@ class ClaudeAcpSession:
             if projector.model_id:
                 self._current_model_id = projector.model_id
             outcome.model_id = self._current_model_id
+            # Same discipline for the posture: a `current_mode_update` seen this
+            # turn is the freshest statement of what is actually in force, and
+            # is recorded rather than answered — see the projector's
+            # `_project_current_mode_update`.
+            if projector.mode_id:
+                self._current_mode_id = projector.mode_id
+            outcome.permission_mode = self._current_mode_id
             reported_usage = result.get("usage")
             if isinstance(reported_usage, dict) and reported_usage:
                 outcome.usage = reported_usage
