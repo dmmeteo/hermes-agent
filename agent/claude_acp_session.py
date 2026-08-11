@@ -79,6 +79,17 @@ class ClaudeCodeAuthRequired(RuntimeError):
     """The adapter has no usable Claude credential."""
 
 
+class ClaudeAcpModelSelectionError(RuntimeError):
+    """A model pick could not be applied to this session (Packet 4 slice B).
+
+    Carries the reason in its message because the reason is the whole content of
+    the answer a user gets: there is no live session yet, the session advertises
+    no models, a turn is in flight, the model was never advertised, or the
+    adapter itself refused. Every one of them leaves the session's model exactly
+    as it was.
+    """
+
+
 @dataclass
 class AcpTurnOutcome:
     """What one delegated turn produced."""
@@ -96,6 +107,14 @@ class AcpTurnOutcome:
     usage: Optional[Dict[str, Any]] = None
     #: Latest ``usage_update``: context occupancy and cost, NOT per-turn tokens.
     context_usage: Optional["UsageSnapshot"] = None
+    #: The model value the session reports as of the end of this turn
+    #: (Packet 4 slice A; a model id or a picker selector — see
+    #: ``claude_code_runtime``) — seeded at connect time from ``session/new`` /
+    #: ``session/load``'s ``configOptions`` and kept current by any
+    #: ``config_option_update`` the turn saw (including an unprompted one from
+    #: the SDK's own refusal fallback). ``None`` when no adapter this runtime
+    #: has talked to has ever reported one.
+    model_id: Optional[str] = None
 
 
 @dataclass
@@ -185,6 +204,23 @@ class ClaudeAcpSession:
         self.stderr_tail: List[str] = []
         self.denied_permissions = 0
         self.granted_permissions = 0
+        #: The model the LIVE adapter reports for this session (Packet 4 slice
+        #: A) — seeded at connect, updated by a ``config_option_update`` or a
+        #: pick, and dropped when the adapter goes. ``None`` until the first
+        #: connect against an adapter that reports one.
+        self._current_model_id: Optional[str] = None
+        #: The models the LIVE adapter advertises as selectable (slice B).
+        #: Same lifetime as ``_current_model_id``: it describes the process
+        #: currently answering, and nothing else.
+        self._model_options: List[Dict[str, str]] = []
+        #: ...and what the last adapter that DID report model state said, kept
+        #: after that adapter is gone. Never offered as a live list — a pick
+        #: cannot be applied to a retired process — but it is what lets the
+        #: ``/model`` seam recognise one of this session's model names instead
+        #: of handing it to the cross-provider resolver, which would silently
+        #: move the conversation (and its billing route) to another provider.
+        self._remembered_model_id: Optional[str] = None
+        self._remembered_model_options: List[Dict[str, str]] = []
         _register(self)
 
     # ---------- introspection ----------
@@ -205,6 +241,203 @@ class ClaudeAcpSession:
     def is_connected(self) -> bool:
         client = self._client
         return client is not None and client.is_alive()
+
+    @property
+    def current_model_id(self) -> Optional[str]:
+        """What the live adapter reports this session's model to be.
+
+        Populated from ``session/new`` / ``session/load`` at connect time and
+        kept current by any ``config_option_update`` a turn observes — see
+        ``run_turn``. ``None`` before the first successful connect, against an
+        adapter that reports none, and once the adapter is gone (its answer
+        describes a process that is no longer running; see
+        :attr:`remembered_model_id`).
+
+        It is ACP's model *selector*, which is a full model id only some of the
+        time — ``agent/claude_code_runtime.py`` owns that distinction.
+        """
+        return self._current_model_id
+
+    @property
+    def model_options(self) -> List[Dict[str, str]]:
+        """The models the live adapter advertises as selectable (slice B).
+
+        Same capture as :attr:`current_model_id`, read from the ``options`` of
+        the "model" ``configOptions`` entry, with the same lifetime. Empty for
+        an adapter that advertises no model options — which is the only signal
+        ACP gives that a pick is not offered here at all — and empty once no
+        adapter is running.
+        """
+        return [dict(option) for option in self._model_options]
+
+    @property
+    def remembered_model_id(self) -> Optional[str]:
+        """The last model state a now-gone adapter reported. Recognition only.
+
+        Survives eviction, a crash and a replacement so that a name this
+        conversation genuinely used stays recognisable; it is never what
+        :meth:`set_model` validates against, because it describes no running
+        process.
+        """
+        return self._remembered_model_id
+
+    @property
+    def remembered_model_options(self) -> List[Dict[str, str]]:
+        """The last advertised list a now-gone adapter reported.
+
+        See :attr:`remembered_model_id`.
+        """
+        return [dict(option) for option in self._remembered_model_options]
+
+    @property
+    def turn_in_flight(self) -> bool:
+        """Whether a turn is running on this session right now.
+
+        One caller drives a session at a time (see the class docstring), so
+        anything that wants to touch session state out-of-band — a model pick —
+        has to be able to ask.
+        """
+        with self._lock:
+            return self._turn is not None
+
+    def set_model(self, model_id: str) -> str:
+        """Switch this session's model in place; return the value now in force.
+
+        Applies the user's pick to the session already running for this
+        conversation with ``session/set_config_option``: no new adapter process,
+        no new ACP session, no re-negotiated roots or permission mode, and
+        nothing replayed — so Packet 2's process/session reuse and Claude Code's
+        own prompt cache both survive a switch.
+
+        Refuses (``ClaudeAcpModelSelectionError``, nothing sent) when there is no
+        live session, when the session advertises no models, when the requested
+        model is not one of them, or when a turn is in flight — a pick landing
+        mid-turn would race the prompt it is meant to affect and the identity
+        capture that turn is performing. An adapter-side rejection is re-raised
+        as the same error type with the adapter's own reason preserved.
+
+        Those guards are re-established after the round trip as well as before
+        it. The RPC runs unlocked — ``request_cancel`` takes the same lock, so
+        holding it for up to 60s would swallow the user's ``/stop`` — which
+        makes "this client, this ACP session, no turn running" true only as of
+        when it was sampled. The commit is therefore what has to be safe: a
+        reply that arrives after the session moved on is discarded rather than
+        written over the identity the live adapter reported.
+        """
+        requested = (model_id or "").strip()
+        if not requested:
+            raise ClaudeAcpModelSelectionError("No model was named.")
+        with self._lock:
+            client, turn = self._client, self._turn
+        session_id = self._acp_session_id
+        if client is None or not client.is_alive() or not session_id:
+            raise ClaudeAcpModelSelectionError(
+                "Claude Code has no live session for this conversation yet — "
+                "send a message first, then pick a model."
+            )
+        if turn is not None:
+            raise ClaudeAcpModelSelectionError(
+                "Claude Code is running a turn — wait for it to finish, or stop "
+                "it first, then pick a model."
+            )
+        advertised = [option["value"] for option in self._model_options]
+        if not advertised:
+            raise ClaudeAcpModelSelectionError(
+                "This Claude Code session advertises no selectable models."
+            )
+        if requested not in advertised:
+            # The advertised list gates the way out as well as the way in: the
+            # adapter would reject an unlisted value anyway, and refusing here
+            # keeps the wire free of picks we already know are invalid.
+            raise ClaudeAcpModelSelectionError(
+                f"Claude Code does not offer {requested} in this session."
+            )
+        from agent.transports.claude_acp_event_projector import (
+            MODEL_CONFIG_OPTION_ID,
+            extract_current_model_id,
+            extract_model_options,
+            has_model_config_option,
+        )
+
+        try:
+            result = client.set_config_option(
+                session_id, MODEL_CONFIG_OPTION_ID, requested
+            )
+        except Exception as exc:
+            # The adapter's reason is the only explanation of WHY (a closed
+            # query stream, model state that drifted from the advertised list).
+            # Losing it would leave the user with "it failed".
+            logger.warning(
+                "Claude Code ACP: the adapter refused a model switch to %s: %s",
+                requested, exc,
+            )
+            raise ClaudeAcpModelSelectionError(str(exc)) from exc
+        # Read the identity out of THIS reply rather than off the client's
+        # standing capture: the agent canonicalises the value it applies, so its
+        # answer wins over our request — and a reply that reported no options at
+        # all must resolve to the value the agent just accepted, not to the one
+        # an earlier response established.
+        config_options = result.get("configOptions")
+        applied = extract_current_model_id(config_options) or requested
+        with self._lock:
+            # Re-establish, under the lock, every guard sampled before the RPC.
+            # They were checked against a session that has been unlocked and
+            # unobserved for as long as the adapter took to answer (up to 60s),
+            # and `request_cancel` needs that lock, so holding it across the
+            # call is not the alternative. If the session moved on — the
+            # adapter was retired and a new one bound, or a turn claimed it —
+            # this reply describes a process that is no longer the one serving
+            # this conversation, and committing it would put a model the live
+            # adapter is not running on every display surface and usage row.
+            stale = (
+                self._client is not client
+                or self._acp_session_id != session_id
+                or self._turn is not None
+            )
+            if not stale:
+                self._current_model_id = applied
+                if has_model_config_option(config_options):
+                    self._model_options = extract_model_options(config_options)
+                self._remember_model_state()
+        if stale:
+            logger.warning(
+                "Claude Code ACP: discarding a model switch to %s — the session "
+                "changed while the adapter was answering", requested,
+            )
+            raise ClaudeAcpModelSelectionError(
+                "Claude Code's session changed while the switch was being "
+                "applied, so it was not kept. Try again."
+            )
+        return applied
+
+    def _capture_model_state(self, client: Any) -> None:
+        """Re-seed the live model state from a freshly connected *client*.
+
+        Unconditional, and that is the point. A rebind can land on a different
+        adapter build — ``matches()`` keys on argv, and an npx-pinned version
+        change does not alter argv — so what the *previous* adapter advertised
+        is not evidence about this one. Carrying it over would leave ``/model``
+        offering models the live session never advertised and validating a pick
+        against them, which turns the gate from "the list Hermes was given"
+        into "whatever the adapter happens to reject", exactly the thing slice
+        B's policy story rests on not being.
+
+        A response that carried no model entry at all therefore reads as "this
+        session reports no model state", not as "keep what you had": the client
+        answers ``None`` for that and ``[]`` for a session that reports an
+        empty list, and both clear.
+        """
+        self._current_model_id = client.current_model_id
+        options = client.available_model_options
+        self._model_options = list(options) if options else []
+        self._remember_model_state()
+
+    def _remember_model_state(self) -> None:
+        """Keep a copy of live model state for recognition after teardown."""
+        if self._current_model_id:
+            self._remembered_model_id = self._current_model_id
+        if self._model_options:
+            self._remembered_model_options = list(self._model_options)
 
     @property
     def workspace_roots(self) -> List[str]:
@@ -282,6 +515,13 @@ class ClaudeAcpSession:
         with self._lock:
             client, self._client = self._client, None
         self._acp_session_id = None
+        # The model state described the process being retired. Keep a copy for
+        # recognition (see `remembered_model_id`) and drop the live view, so
+        # nothing can present a dead adapter's list as what this conversation
+        # offers now — the next connect re-seeds from whatever answers.
+        self._remember_model_state()
+        self._current_model_id = None
+        self._model_options = []
         if client is None:
             return
         try:
@@ -385,6 +625,11 @@ class ClaudeAcpSession:
 
         if not self._acp_session_id:
             self._acp_session_id = client.session_new(additional_directories=roots)
+
+        # Packet 4: whichever of session/new or session/load just ran populated
+        # the client's configOptions capture — both the authoritative model id
+        # (slice A) and the models this session offers (slice B).
+        self._capture_model_state(client)
 
         # SECURITY: the adapter starts in `auto`, where a classifier approves
         # writes and shell commands without ever asking Hermes. Move it to
@@ -532,6 +777,13 @@ class ClaudeAcpSession:
             outcome.stop_reason = result.get("stopReason")
             outcome.tool_iterations = projector.tool_iterations
             outcome.context_usage = projector.usage
+            # A config_option_update seen THIS turn (a user-driven switch, or —
+            # just as often — the SDK's own unprompted refusal fallback) is the
+            # freshest signal; absent one, the identity connect-time seeded (or
+            # an earlier turn updated) is still current.
+            if projector.model_id:
+                self._current_model_id = projector.model_id
+            outcome.model_id = self._current_model_id
             reported_usage = result.get("usage")
             if isinstance(reported_usage, dict) and reported_usage:
                 outcome.usage = reported_usage

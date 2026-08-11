@@ -5287,7 +5287,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # changes mid-session, so the TUI would show a stale name after
         # _try_activate_fallback() switches provider/model.
         agent = getattr(self, "agent", None)
-        model_name = (getattr(agent, "model", None) or self.model or "unknown")
+        # Packet 4 slice A: for the Claude Code ACP runtime, agent.model is a
+        # static pseudo-model ("claude-code") that deliberately never changes
+        # (see agent/claude_code_runtime.py's module docstring on why it must
+        # not) — the live model is a separately captured identity.
+        claude_acp_label = None
+        try:
+            from agent.claude_code_runtime import claude_acp_display_model
+
+            claude_acp_label = claude_acp_display_model(agent)
+        except Exception:
+            claude_acp_label = None
+        model_name = (
+            claude_acp_label
+            or getattr(agent, "model", None)
+            or self.model
+            or "unknown"
+        )
         # Friendly display: prefer reverse-alias from config.yaml ``model_aliases:``
         # before slash/length truncation. This turns long Palantir RIDs like
         # ``ri.language-model-service..language-model.anthropic-claude-4-7-opus``
@@ -9501,6 +9517,48 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # CLI decoration: "  ✗ " prefix over the canonical error copy.
             _cprint(f"  ✗ {request.error_messages()[0]}")
             return
+
+        # --refresh: wipe the on-disk picker cache. Forces a live re-fetch of
+        # every authed provider's /v1/models endpoint on this open. Runs before
+        # the Claude Code seam below, exactly as the gateway's /model does
+        # (gateway/slash_commands.py): the flag is about Hermes' own provider
+        # catalog on disk, not about any one session's advertised list, so a
+        # surface that returns from the seam first would silently drop it and
+        # `--refresh` would mean different things in the terminal and on
+        # Discord/Telegram.
+        if force_refresh:
+            try:
+                from hermes_cli.models import clear_provider_models_cache
+                clear_provider_models_cache()
+                _cprint("  Cleared model picker cache. Refreshing...")
+            except Exception:
+                pass
+
+        # Packet 4 slice B: a live Claude Code (ACP) session picks its model
+        # from the list that session itself advertises, applied in place — the
+        # cross-provider path below would resolve another provider's route and
+        # retire the adapter. The shared seam answers only what it owns and
+        # returns None for everything else (another provider's model,
+        # --provider, no live session), so the rest of /model is untouched.
+        # Guarded: /model is how a user recovers from a bad route, so a fault
+        # here must degrade to the pre-slice-B behaviour, never break it.
+        try:
+            from hermes_cli.claude_acp_model_select import (
+                handle_claude_acp_model_command,
+            )
+
+            _claude_acp_reply = handle_claude_acp_model_command(
+                getattr(self, "agent", None), request
+            )
+        except Exception as exc:
+            logger.debug("Claude Code /model seam raised: %s", exc, exc_info=True)
+            _claude_acp_reply = None
+        if _claude_acp_reply is not None:
+            _prefix = "  ✓ " if _claude_acp_reply.success else "  ✗ "
+            for _index, _line in enumerate(_claude_acp_reply.text.splitlines()):
+                _cprint(f"{_prefix}{_line}" if _index == 0 else f"    {_line}")
+            return
+
         # Resolve the effective persistence once: --global forces persist,
         # --session/--once force session-scope, otherwise defer to
         # model.persist_switch_by_default (defaults to False so /model is
@@ -9509,17 +9567,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             is_global_flag, is_session, is_once=one_turn,
             explicit_provider=explicit_provider,
         )
-
-        # --refresh: wipe the on-disk picker cache before building the
-        # provider list. Forces a live re-fetch of every authed provider's
-        # /v1/models endpoint on this open.
-        if force_refresh:
-            try:
-                from hermes_cli.models import clear_provider_models_cache
-                clear_provider_models_cache()
-                _cprint("  Cleared model picker cache. Refreshing...")
-            except Exception:
-                pass
 
         # Single inventory context — replaces the inline config-slice the
         # dashboard / TUI used to duplicate. Overlay live session state
@@ -11569,9 +11616,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         msg_count = len(self.conversation_history)
         elapsed = format_duration_compact((datetime.now() - self.session_start).total_seconds())
 
+        # Packet 4 slice A: the Claude Code ACP runtime's agent.model is a
+        # static pseudo-model ("claude-code") that deliberately never
+        # changes; show the live model here instead when one is known.
+        try:
+            from agent.claude_code_runtime import claude_acp_display_model
+
+            display_model = claude_acp_display_model(agent) or agent.model
+        except Exception:
+            display_model = agent.model
         print("  📊 Session Token Usage")
         print(f"  {'─' * 40}")
-        print(f"  Model:                     {agent.model}")
+        print(f"  Model:                     {display_model}")
         print(f"  Input tokens:              {input_tokens:>10,}")
         print(f"  Output tokens:             {output_tokens:>10,}")
         if reasoning_tokens:

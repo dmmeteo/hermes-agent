@@ -53,6 +53,71 @@ def _attach_agent(
     return cli_obj
 
 
+class TestClaudeAcpModelIdentityInStatusBar:
+    """Packet 4 slice A: the footer shows the live Claude Code model, not the
+    static pseudo-model ``"claude-code"`` — see
+    ``agent.claude_code_runtime.claude_acp_display_model``."""
+
+    def _attach_claude_acp_agent(self, cli_obj, *, label=None):
+        cli_obj = _attach_agent(
+            cli_obj,
+            prompt_tokens=0, completion_tokens=0, total_tokens=0,
+            api_calls=0, context_tokens=0, context_length=200_000,
+        )
+        cli_obj.agent.model = "claude-code"
+        cli_obj.agent.provider = "claude-code-acp"
+        if label is not None:
+            from agent.claude_code_runtime import ClaudeAcpModelIdentity
+
+            cli_obj.agent._claude_acp_model_identity = ClaudeAcpModelIdentity(
+                model_id="claude-sonnet-5-20260815", label=label,
+            )
+        return cli_obj
+
+    def test_snapshot_prefers_the_claude_acp_label_over_the_pseudo_model(self):
+        cli_obj = _make_cli(model="claude-code")
+        cli_obj = self._attach_claude_acp_agent(cli_obj, label="sonnet-5")
+
+        snapshot = cli_obj._get_status_bar_snapshot()
+
+        assert snapshot["model_short"] == "sonnet-5"
+
+    def test_a_picker_selector_is_shown_by_name_not_as_a_raw_token(self):
+        """The adapter's ``currentValue`` is a picker selector, and in the
+        default configuration it is literally ``"default"`` — a token that
+        names no model. The identity is recorded through the real writer here
+        (not a hand-written label) so the footer copy is the production one."""
+        from agent.claude_code_runtime import _record_model_identity
+
+        cli_obj = _make_cli(model="claude-code")
+        cli_obj = self._attach_claude_acp_agent(cli_obj)
+        cli_obj.agent._claude_acp_session = None
+        _record_model_identity(cli_obj.agent, "default")
+
+        snapshot = cli_obj._get_status_bar_snapshot()
+
+        assert snapshot["model_short"] == "Default"
+
+    def test_snapshot_falls_back_to_the_pseudo_model_before_any_identity(self):
+        cli_obj = _make_cli(model="claude-code")
+        cli_obj = self._attach_claude_acp_agent(cli_obj, label=None)
+
+        snapshot = cli_obj._get_status_bar_snapshot()
+
+        assert snapshot["model_short"] == "claude-code"
+
+    def test_non_acp_agent_is_unaffected(self):
+        cli_obj = _attach_agent(
+            _make_cli(model="anthropic/claude-sonnet-4-20250514"),
+            prompt_tokens=10, completion_tokens=5, total_tokens=15,
+            api_calls=1, context_tokens=15, context_length=200_000,
+        )
+
+        snapshot = cli_obj._get_status_bar_snapshot()
+
+        assert snapshot["model_short"] == "claude-sonnet-4-20250514"
+
+
 class TestCLIStatusBar:
     def test_session_title_is_right_aligned_after_it_is_queued(self):
         cli_obj = _make_cli()
@@ -216,6 +281,27 @@ class TestCLIStatusBar:
 
 
 class TestCLIUsageReport:
+    def test_show_usage_prefers_the_claude_acp_display_model(self, capsys):
+        """Packet 4 slice A: /usage shows the live model, not "claude-code"."""
+        from agent.claude_code_runtime import ClaudeAcpModelIdentity
+
+        cli_obj = _attach_agent(
+            _make_cli(model="claude-code"),
+            prompt_tokens=10, completion_tokens=5, total_tokens=15,
+            api_calls=1, context_tokens=15, context_length=200_000,
+        )
+        cli_obj.agent.provider = "claude-code-acp"
+        cli_obj.agent._claude_acp_model_identity = ClaudeAcpModelIdentity(
+            model_id="claude-sonnet-5-20260815", label="sonnet-5",
+        )
+        cli_obj.verbose = False
+
+        cli_obj._show_usage()
+        output = capsys.readouterr().out
+
+        assert "sonnet-5" in output
+        assert "claude-code" not in output
+
     def test_show_usage_omits_cost_reporting(self, capsys):
         cli_obj = _attach_agent(
             _make_cli(),

@@ -769,7 +769,13 @@ class GatewaySlashCommandsMixin:
             used = getattr(ctx, "last_prompt_tokens", 0) or 0
             context_length = getattr(ctx, "context_length", 0) or 0
 
-        model_name = _clean_str(getattr(agent, "model", "")) if has_agent else ""
+        model_name = _clean_str(self._display_model_for(agent)) if has_agent else ""
+        # The window lookup below is keyed on model ids, so it gets the
+        # accounting id rather than the display label — for every other
+        # provider both are just `agent.model` and nothing changes.
+        metadata_model = (
+            _clean_str(self._metadata_model_for(agent)) if has_agent else ""
+        )
 
         if not used:
             used = _int_value(getattr(session_entry, "last_prompt_tokens", 0))
@@ -782,12 +788,14 @@ class GatewaySlashCommandsMixin:
             except Exception:
                 model_name = ""
 
-        if not context_length and model_name:
+        if not metadata_model:
+            metadata_model = model_name
+        if not context_length and metadata_model:
             try:
                 from agent.model_metadata import get_model_context_length
 
                 context_length = _int_value(
-                    await asyncio.to_thread(get_model_context_length, model_name)
+                    await asyncio.to_thread(get_model_context_length, metadata_model)
                 )
             except Exception:
                 context_length = 0
@@ -1216,7 +1224,7 @@ class GatewaySlashCommandsMixin:
                     "elapsed": elapsed,
                     "state": t("gateway.agents.state_starting") if is_pending else t("gateway.agents.state_running"),
                     "session_id": "" if is_pending else str(getattr(agent, "session_id", "") or ""),
-                    "model": "" if is_pending else str(getattr(agent, "model", "") or ""),
+                    "model": "" if is_pending else self._display_model_for(agent),
                 }
             )
 
@@ -1668,6 +1676,70 @@ class GatewaySlashCommandsMixin:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
+    @staticmethod
+    def _display_model_for(agent) -> str:
+        """What to show as *agent*'s model on a gateway surface.
+
+        For the Claude Code ACP runtime ``agent.model`` is a static
+        pseudo-model (``"claude-code"``) that deliberately never changes — the
+        live model is a separately captured identity (see
+        ``agent/claude_code_runtime.py``). Every other provider is unaffected:
+        the seam answers ``None`` unless a Claude Code identity was captured.
+        Guarded, because a display must never be what breaks a command.
+        """
+        try:
+            from agent.claude_code_runtime import claude_acp_display_model
+
+            label = claude_acp_display_model(agent)
+        except Exception:
+            label = None
+        return label or str(getattr(agent, "model", "") or "")
+
+    @staticmethod
+    def _metadata_model_for(agent) -> str:
+        """The model string to look model *metadata* up with (context window).
+
+        The display label is the wrong key for that — the metadata tables are
+        keyed on ids — so this asks the runtime for its accounting id, which
+        falls back to the pseudo-model when ACP reported only a picker
+        selector. See ``claude_acp_usage_model``.
+        """
+        try:
+            from agent.claude_code_runtime import (
+                claude_acp_model_identity,
+                claude_acp_usage_model,
+            )
+
+            if claude_acp_model_identity(agent) is not None:
+                return claude_acp_usage_model(agent)
+        except Exception:
+            pass
+        return str(getattr(agent, "model", "") or "")
+
+    def _resident_agent_for_session(self, session_key: str):
+        """The agent already serving *session_key*, or ``None``.
+
+        Mid-turn it lives in ``_running_agents``, between turns in
+        ``_agent_cache`` — the same two places ``/usage`` looks, and for the same
+        reason: a command about the live conversation must find the agent
+        wherever the turn boundary left it. Never creates one; a session with no
+        resident agent genuinely has no live state to report on.
+        """
+        from gateway.run import _AGENT_PENDING_SENTINEL
+
+        agent = (getattr(self, "_running_agents", None) or {}).get(session_key)
+        if agent is not None and agent is not _AGENT_PENDING_SENTINEL:
+            return agent
+        cache_lock = getattr(self, "_agent_cache_lock", None)
+        cache = getattr(self, "_agent_cache", None)
+        if cache_lock is None or cache is None:
+            return None
+        with cache_lock:
+            cached = cache.get(session_key)
+        if isinstance(cached, tuple):
+            return cached[0] if cached else None
+        return cached
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model.
 
@@ -1716,7 +1788,11 @@ class GatewaySlashCommandsMixin:
             explicit_provider=explicit_provider,
         )
 
-        # --refresh: bust the disk cache so the picker shows live data.
+        # --refresh: bust the disk cache so the picker shows live data. Ahead of
+        # the Claude Code seam below, and cli.py's /model does it in the same
+        # order — the flag is about Hermes' own provider catalog on disk, not
+        # about one session's advertised list, so both surfaces honour it
+        # whether or not the seam then answers the command.
         if force_refresh:
             try:
                 from hermes_cli.models import clear_provider_models_cache
@@ -1769,6 +1845,40 @@ class GatewaySlashCommandsMixin:
             current_provider = override.get("provider", current_provider)
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
+
+        # Packet 4 slice B: a live Claude Code (ACP) session picks its model
+        # from the list that session advertises, applied in place on the
+        # resident agent. Deliberately NOT the switch path below: that resolves
+        # another provider's route, sets a session override and evicts the
+        # cached agent, which would retire the adapter and the Claude-side
+        # session on every pick (Packet 2's reuse). The shared seam — the same
+        # one cli.py calls, so Discord/Telegram and the terminal cannot drift —
+        # returns None for everything it does not own, leaving the rest of
+        # /model exactly as it was. Offloaded: applying a pick is a blocking
+        # JSON-RPC round trip to the adapter and must not run on the loop.
+        claude_acp_reply = None
+        try:
+            resident_agent = self._resident_agent_for_session(session_key)
+            # Cheap attribute gate first: every other provider's /model must not
+            # pay a worker-thread hop (or this module's import) to be told "not
+            # mine". The seam re-checks this authoritatively, along with whether
+            # a live session exists at all.
+            if getattr(resident_agent, "api_mode", None) == "claude_code_acp":
+                from hermes_cli.claude_acp_model_select import (
+                    handle_claude_acp_model_command,
+                )
+
+                claude_acp_reply = await asyncio.to_thread(
+                    handle_claude_acp_model_command, resident_agent, request,
+                )
+        except Exception as exc:
+            # /model is how a user recovers a bad route; a fault in this seam
+            # must fall through to the ordinary path, never break it.
+            logger.debug("Claude Code /model seam raised: %s", exc, exc_info=True)
+        if claude_acp_reply is not None:
+            if claude_acp_reply.success:
+                return claude_acp_reply.text
+            return t("gateway.model.error_prefix", error=claude_acp_reply.text)
 
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
@@ -5104,7 +5214,9 @@ class GatewaySlashCommandsMixin:
             output_tokens = getattr(agent, "session_output_tokens", 0) or 0
 
             lines.append(t("gateway.usage.header_session"))
-            lines.append(t("gateway.usage.label_model", model=agent.model))
+            lines.append(
+                t("gateway.usage.label_model", model=self._display_model_for(agent))
+            )
             lines.append(t("gateway.usage.label_input_tokens", count=f"{input_tokens:,}"))
             lines.append(t("gateway.usage.label_output_tokens", count=f"{output_tokens:,}"))
             lines.append(t("gateway.usage.label_total", count=f"{agent.session_total_tokens:,}"))

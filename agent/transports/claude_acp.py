@@ -283,6 +283,12 @@ class ClaudeAcpClient:
         self.protocol_version: Optional[int] = None
         self.agent_capabilities: dict[str, Any] = {}
         self.auth_methods: list[dict] = []
+        #: Raw ``configOptions`` from the most recent ``session/new`` /
+        #: ``session/load`` response. ACP has no dedicated "current model"
+        #: field (Packet 4 slice A) — the adapter reports it as this generic
+        #: option list's "model" entry, so this is captured verbatim here and
+        #: read back through :attr:`current_model_id`.
+        self.session_config_options: Optional[list] = None
 
         self._reader = threading.Thread(
             target=self._read_stdout, name="acp-stdout", daemon=True
@@ -310,6 +316,50 @@ class ClaudeAcpClient:
     @property
     def session_capabilities(self) -> dict[str, Any]:
         return self.agent_capabilities.get("sessionCapabilities") or {}
+
+    @property
+    def current_model_id(self) -> Optional[str]:
+        """The agent-reported model selector for this session, or ``None``.
+
+        Read from the "model" entry of the last ``session/new`` /
+        ``session/load`` response's ``configOptions`` — an older adapter that
+        never reports one, or a client that has not created a session yet,
+        both read as ``None`` rather than a fabricated default.
+
+        It is the *picker's* value: often a full model id, but ``"default"``
+        or a family alias just as legitimately (see
+        ``extract_current_model_id``).
+        """
+        from agent.transports.claude_acp_event_projector import (
+            extract_current_model_id,
+        )
+
+        return extract_current_model_id(self.session_config_options)
+
+    @property
+    def available_model_options(self) -> Optional[list[dict[str, str]]]:
+        """Every model the current session advertises as selectable.
+
+        The write-side companion to :attr:`current_model_id`, read from the
+        same captured ``configOptions`` (Packet 4 slice B). ``[]`` for an agent
+        that advertises no model options — ACP publishes no capability for
+        this, so an empty list is the only available "cannot pick a model here"
+        signal.
+
+        ``None`` is the *other* answer: this client's last session response
+        carried no model entry at all (or it has created no session yet), so it
+        reports nothing about models rather than reporting emptiness. A caller
+        refreshing session state must keep those apart — see
+        ``ClaudeAcpSession._capture_model_state``.
+        """
+        from agent.transports.claude_acp_event_projector import (
+            extract_model_options,
+            has_model_config_option,
+        )
+
+        if not has_model_config_option(self.session_config_options):
+            return None
+        return extract_model_options(self.session_config_options)
 
     @property
     def supports_additional_directories(self) -> bool:
@@ -541,6 +591,9 @@ class ClaudeAcpClient:
         session_id = result.get("sessionId")
         if not session_id:
             raise AcpProtocolError("session/new returned no sessionId")
+        config_options = result.get("configOptions")
+        if isinstance(config_options, list):
+            self.session_config_options = config_options
         return session_id
 
     def set_mode(
@@ -561,6 +614,42 @@ class ClaudeAcpClient:
             {"sessionId": session_id, "modeId": mode_id},
             timeout=timeout,
         )
+
+    def set_config_option(
+        self,
+        session_id: str,
+        config_id: str,
+        value: str,
+        timeout: float = 60.0,
+    ) -> dict:
+        """Set one of the session's config options; return the agent's reply.
+
+        The protocol verb behind a model pick (Packet 4 slice B). The reply
+        carries the whole refreshed ``configOptions`` list, so the local capture
+        is replaced from it — the agent may canonicalise the value it was given
+        (an alias resolving to a full model id) or clamp a dependent option, and
+        the reply is the only place that lands.
+
+        Raises :class:`AcpError` when the agent rejects the option or the value.
+        Nothing local is updated on that path: a rejected pick must leave the
+        captured identity exactly as it was.
+
+        SECURITY: this verb is generic — the same call writes ``mode``, whose
+        values include ``bypassPermissions`` and ``acceptEdits``. Packet 1's
+        entire containment story is the ``default`` mode negotiated in
+        ``ClaudeAcpSession._connect()``, so a permission mode must keep going
+        through :meth:`set_mode` on that path and must never be reached for
+        through this one.
+        """
+        result = self.request(
+            "session/set_config_option",
+            {"sessionId": session_id, "configId": config_id, "value": value},
+            timeout=timeout,
+        )
+        config_options = result.get("configOptions")
+        if isinstance(config_options, list):
+            self.session_config_options = config_options
+        return result
 
     def session_load(
         self,
@@ -589,13 +678,17 @@ class ClaudeAcpClient:
         }
         if additional_directories:
             params["additionalDirectories"] = list(additional_directories)
-        return self._request_pumping(
+        result = self._request_pumping(
             "session/load",
             params,
             on_update=on_update,
             on_request=None,
             timeout=timeout,
         )
+        config_options = result.get("configOptions")
+        if isinstance(config_options, list):
+            self.session_config_options = config_options
+        return result
 
     def cancel(self, session_id: str) -> None:
         """Ask the agent to abort the in-flight turn.

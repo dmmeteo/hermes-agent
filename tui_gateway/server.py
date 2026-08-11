@@ -5229,8 +5229,24 @@ def _session_info(agent, session: dict | None = None) -> dict:
     pending_switch = (session or {}).get("pending_model_switch") or {}
     pending_model = str(pending_switch.get("display_model") or "").strip()
     pending_provider = str(pending_switch.get("display_provider") or "").strip()
+    # Packet 4 slice A: agent.model is a static pseudo-model ("claude-code")
+    # for the Claude Code ACP runtime and deliberately never changes (see
+    # agent/claude_code_runtime.py's module docstring) — report the live
+    # model here instead when one is known. A queued /model switch is more
+    # specific and more recent, so it still wins over a captured identity.
+    claude_acp_label = None
+    try:
+        from agent.claude_code_runtime import claude_acp_display_model
+
+        claude_acp_label = claude_acp_display_model(agent)
+    except Exception:
+        claude_acp_label = None
     info: dict = {
-        "model": pending_model or mirror.get("model", getattr(agent, "model", "")),
+        "model": (
+            pending_model
+            or claude_acp_label
+            or mirror.get("model", getattr(agent, "model", ""))
+        ),
         "provider": pending_provider
         or mirror.get("provider", getattr(agent, "provider", "")),
         "reasoning_effort": reasoning_effort,

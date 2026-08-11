@@ -51,6 +51,99 @@ class TestHandshake:
         assert client.session_new() == "sess-1"
 
 
+class TestModelIdentity:
+    """Packet 4 slice A: the authoritative model id, read from ``configOptions``.
+
+    ACP has no dedicated "current model" field on ``session/new`` — the pinned
+    adapter (0.66.0) reports it as the ``currentValue`` of the "model" entry in
+    the generic ``configOptions`` list, the same list ``config_option_update``
+    later re-sends on any change (see ``claude_acp_event_projector.py``'s
+    ``extract_current_model_id``, which this property shares).
+    """
+
+    def test_current_model_id_is_none_before_any_session(self, client):
+        assert client.current_model_id is None
+
+    def test_current_model_id_reads_the_model_config_option(self, client):
+        client.initialize()
+        client.session_new()
+        assert client.current_model_id == "claude-sonnet-5-20260815"
+
+
+class TestModelSelection:
+    """Packet 4 slice B: read the advertised models, then switch with
+    ``session/set_config_option``.
+
+    ACP advertises no capability for this — there is no
+    ``agentCapabilities`` flag for ``configOptions`` (confirmed against
+    adapter 0.66.0's ``initialize`` reply). The gate is therefore the option
+    list itself: an agent that advertises no selectable model offers nothing
+    to pick, and the request is never sent.
+    """
+
+    def test_available_model_options_is_none_before_any_session(self, client):
+        """``None``, not ``[]``. Nothing has told this client anything about
+        models, which is a different fact from a session that advertises none
+        — and a reconnect that reads the first as the second keeps the previous
+        adapter's list alive (see ``ClaudeAcpSession._capture_model_state``)."""
+        assert client.available_model_options is None
+
+    def test_available_model_options_is_empty_when_the_entry_advertises_none(
+        self, client
+    ):
+        """The other side of that distinction: the session DID report its model
+        state, and the state is "no model is selectable here"."""
+        client.session_config_options = [
+            {"id": "model", "type": "select", "currentValue": "claude-sonnet-5",
+             "options": []},
+        ]
+        assert client.available_model_options == []
+        assert client.current_model_id == "claude-sonnet-5"
+
+    def test_available_model_options_lists_what_the_agent_advertised(self, client):
+        client.initialize()
+        client.session_new()
+        assert [o["value"] for o in client.available_model_options] == [
+            "claude-sonnet-5-20260815",
+            "claude-haiku-4-5-20251001",
+        ]
+
+    def test_set_config_option_switches_the_live_model(self, client):
+        client.initialize()
+        session_id = client.session_new()
+        client.set_config_option(
+            session_id, "model", "claude-haiku-4-5-20251001"
+        )
+        assert client.current_model_id == "claude-haiku-4-5-20251001"
+
+    def test_set_config_option_refreshes_the_captured_option_list(self, client):
+        """The reply carries the whole refreshed ``configOptions`` list, so the
+        capture the identity is read from must be replaced, not appended to."""
+        client.initialize()
+        session_id = client.session_new()
+        result = client.set_config_option(
+            session_id, "model", "claude-haiku-4-5-20251001"
+        )
+        assert isinstance(result.get("configOptions"), list)
+        assert [o["value"] for o in client.available_model_options] == [
+            "claude-sonnet-5-20260815",
+            "claude-haiku-4-5-20251001",
+        ]
+
+    def test_a_rejected_value_raises_and_leaves_the_identity_alone(self, client):
+        client.initialize()
+        session_id = client.session_new()
+        with pytest.raises(AcpError):
+            client.set_config_option(session_id, "model", "gpt-5.5")
+        assert client.current_model_id == "claude-sonnet-5-20260815"
+
+    def test_an_unknown_config_option_raises(self, client):
+        client.initialize()
+        session_id = client.session_new()
+        with pytest.raises(AcpError):
+            client.set_config_option(session_id, "not-an-option", "x")
+
+
 class TestPromptTurn:
     def test_prompt_streams_updates_then_returns_stop_reason(self, client, tmp_path):
         client.initialize()

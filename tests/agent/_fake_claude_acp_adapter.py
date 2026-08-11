@@ -100,6 +100,31 @@ Env vars:
     ``partial-tag``   answer with text whose last character could start a
                       ``<think>`` tag, so the streaming scrubber holds it back
                       until the turn is flushed
+    ``model-fallback``
+                      like ``normal``, but emits a ``config_option_update``
+                      part-way through the turn switching the "model"
+                      ``configOptions`` entry from ``FAKE_ACP_MODEL_ID`` to
+                      ``FAKE_ACP_FALLBACK_MODEL_ID`` — models the adapter's own
+                      SDK-side refusal fallback (``syncModelAfterRefusalFallback``
+                      in ``dist/acp-agent.js``), which is unprompted and carries
+                      no separate "fallback happened" event of its own
+
+``FAKE_ACP_MODEL_ID`` / ``FAKE_ACP_FALLBACK_MODEL_ID`` (Packet 4 slice A):
+override the model id ``session/new`` / ``session/load`` report (and, in
+``model-fallback`` mode, the id switched to mid-turn). Every response that
+carries ``configOptions`` includes a "model" entry — this is the ONLY place
+ACP exposes a session's authoritative model, mirroring the pinned adapter
+(0.66.0), which always sends one.
+
+``FAKE_ACP_MODEL_OPTIONS`` / ``FAKE_ACP_NO_MODEL_OPTIONS`` (Packet 4 slice B):
+the comma-separated model ids this session advertises as *selectable* (the
+"model" entry's ``options``), and a switch that makes it advertise none at all
+— the older/allowlist-empty adapter Hermes must offer nothing for.
+``session/set_config_option`` moves the live model between them.
+
+``FAKE_ACP_LOAD_NO_CONFIG_OPTIONS`` (Packet 4): answer ``session/load`` with no
+``configOptions`` key at all, so a test can rebind against an adapter build
+that reports its session config only on ``session/new``.
 """
 
 from __future__ import annotations
@@ -112,6 +137,55 @@ import threading
 import time
 
 _MODE = os.getenv("FAKE_ACP_MODE", "normal")
+# Packet 4 slice A: the model id every session/new, session/load and
+# config_option_update reports via the "model" configOptions entry — the only
+# place ACP exposes the session's authoritative model.
+_MODEL_ID = os.getenv("FAKE_ACP_MODEL_ID", "claude-sonnet-5-20260815")
+_FALLBACK_MODEL_ID = os.getenv(
+    "FAKE_ACP_FALLBACK_MODEL_ID", "claude-haiku-4-5-20251001"
+)
+#: The model this adapter process is currently running. Starts at the id
+#: `session/new` reports and moves when `session/set_config_option` switches it
+#: (Packet 4 slice B) or the SDK's own refusal fallback fires (slice A).
+_current_model_id = _MODEL_ID
+#: The models this session advertises as SELECTABLE (Packet 4 slice B) — the
+#: real adapter builds this from `availableModels`, i.e. the user's own Claude
+#: settings allowlist, so Hermes may only offer what is listed here.
+_MODEL_OPTIONS = [
+    value.strip()
+    for value in os.getenv(
+        "FAKE_ACP_MODEL_OPTIONS",
+        f"{_MODEL_ID},{_FALLBACK_MODEL_ID},claude-opus-4-1-20250805",
+    ).split(",")
+    if value.strip()
+]
+_MODEL_OPTION_NAMES = {
+    "claude-sonnet-5-20260815": "Sonnet 5",
+    "claude-haiku-4-5-20251001": "Haiku 4.5",
+    "claude-opus-4-1-20250805": "Opus 4.1",
+    # Picker *selectors* rather than model ids. The real adapter always
+    # prepends a "default" row (`applyAvailableModelsAllowlist` in
+    # `dist/acp-agent.js`) and `resolveModelPreference` accepts family
+    # aliases, so `currentValue` is routinely one of these and NOT an
+    # authoritative id — the display name is the only thing that names a
+    # model there.
+    "default": "Default",
+    "sonnet": "Sonnet 5",
+    "opus": "Opus 4.1",
+}
+#: Models an adapter that reports a current model but advertises no selectable
+#: list at all — nothing for Hermes to offer, and nothing it may switch to.
+_NO_MODEL_OPTIONS = os.getenv("FAKE_ACP_NO_MODEL_OPTIONS", "") == "1"
+#: Reject every ``session/set_config_option`` even for an advertised value —
+#: the real adapter does this when the SDK query stream already ended, or when
+#: its own model state drifted from the list it last advertised.
+_REJECT_SET_CONFIG = os.getenv("FAKE_ACP_REJECT_SET_CONFIG", "") == "1"
+#: Answer ``session/load`` with no ``configOptions`` key at all — an adapter
+#: build that reports its session config on ``session/new`` only. Distinct from
+#: ``FAKE_ACP_NO_MODEL_OPTIONS`` (an entry that advertises nothing): one says
+#: "this response carries no model state", the other "the model state is empty",
+#: and a rebind must not treat either as "keep whatever the last adapter said".
+_LOAD_NO_CONFIG_OPTIONS = os.getenv("FAKE_ACP_LOAD_NO_CONFIG_OPTIONS", "") == "1"
 _RECORD_PATH = os.getenv("FAKE_ACP_RECORD", "")
 _RECORD_DIR = os.getenv("FAKE_ACP_RECORD_DIR", "")
 _STORE_DIR = os.getenv("FAKE_ACP_STORE", "")
@@ -164,6 +238,9 @@ _record: dict = {
     "client_capabilities": None,
     # Every session/cancel this adapter received, in order.
     "cancel_calls": [],
+    # Packet 4 slice B evidence: every session/set_config_option this adapter
+    # was asked to apply, in order — including ones it rejected.
+    "set_config_option_calls": [],
     # Replies to the agent-initiated requests this adapter sent, so a test can
     # assert HOW the client refused rather than only that the turn survived.
     "client_request_replies": [],
@@ -519,6 +596,77 @@ def _handle_permission(session_id: str, msg: dict) -> None:
     _send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}})
 
 
+def _model_config_options(model_id: str = "") -> list:
+    """The ``configOptions`` shape the pinned adapter always includes.
+
+    Real shape (``buildConfigOptions`` in ``dist/acp-agent.js``): a "mode"
+    entry plus this "model" one, whose ``currentValue`` is the authoritative
+    model id (Packet 4 slice A) and whose ``options`` are the models this
+    session advertises as selectable (slice B). "mode" is included for shape
+    fidelity and left inert.
+
+    ``model_id`` defaults to whatever this adapter process currently runs, so
+    a switch made through ``session/set_config_option`` is reflected in every
+    later response.
+    """
+    current = model_id or _current_model_id
+    model_option: dict = {
+        "id": "model", "name": "Model", "type": "select",
+        "currentValue": current,
+    }
+    if not _NO_MODEL_OPTIONS:
+        model_option["options"] = [
+            {"value": value, "name": _MODEL_OPTION_NAMES.get(value, value)}
+            for value in _MODEL_OPTIONS
+        ]
+    return [
+        {"id": "mode", "name": "Mode", "type": "select", "currentValue": "default",
+         "options": [{"value": "default", "name": "Default"}]},
+        model_option,
+    ]
+
+
+def _handle_set_config_option(msg: dict) -> None:
+    """Answer ``session/set_config_option`` the way adapter 0.66.0 does.
+
+    Three outcomes, all of them load-bearing for the client: an unknown option
+    id and a value the option never advertised are both errors that leave the
+    session's model untouched, and a valid pick replies with the whole
+    refreshed ``configOptions`` list — never a partial patch, and (unlike the
+    SDK's own refusal fallback) never an accompanying ``config_option_update``
+    notification.
+    """
+    global _current_model_id
+    params = msg.get("params") or {}
+    config_id = params.get("configId")
+    value = params.get("value")
+    with _record_lock:
+        _record["set_config_option_calls"].append(
+            {"configId": config_id, "value": value,
+             "sessionId": params.get("sessionId")}
+        )
+    _flush_record()
+    if config_id != "model":
+        _send({"jsonrpc": "2.0", "id": msg["id"], "error": {
+            "code": -32603, "message": f"Unknown config option: {config_id}",
+        }})
+        return
+    if _REJECT_SET_CONFIG:
+        _send({"jsonrpc": "2.0", "id": msg["id"], "error": {
+            "code": -32603, "message": "Session has ended",
+        }})
+        return
+    if _NO_MODEL_OPTIONS or value not in _MODEL_OPTIONS:
+        _send({"jsonrpc": "2.0", "id": msg["id"], "error": {
+            "code": -32603,
+            "message": f"Invalid value for config option model: {value}",
+        }})
+        return
+    _current_model_id = value
+    _send({"jsonrpc": "2.0", "id": msg["id"],
+           "result": {"configOptions": _model_config_options()}})
+
+
 def _new_session_id() -> str:
     """A fresh session id, unique across adapter processes and sessions."""
     global _session_counter
@@ -559,7 +707,10 @@ def _handle_load(msg: dict) -> None:
     # the user-visible response.
     for prompt in stored.get("prompts") or []:
         _text(session_id, f"REPLAYED-HISTORY:{prompt}")
-    _send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+    load_result: dict = {}
+    if not _LOAD_NO_CONFIG_OPTIONS:
+        load_result["configOptions"] = _model_config_options()
+    _send({"jsonrpc": "2.0", "id": msg["id"], "result": load_result})
     if _MODE == "load-replays-late":
         # The nastier shape of the same hazard: a replay notification emitted
         # AFTER the load reply, i.e. once the client has moved on. stdio is
@@ -678,6 +829,22 @@ def _handle_prompt(msg: dict) -> None:
         _send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}})
         return
 
+    if _MODE == "model-fallback":
+        # The SDK swapped the live model out from under the session — the
+        # adapter never announces this as its own event kind, it just re-sends
+        # configOptions (config_option_update) with the new value, exactly as
+        # a user-driven /model switch would. Unprompted and mid-turn.
+        global _current_model_id
+        _text(session_id, "Let me think. ")
+        _current_model_id = _FALLBACK_MODEL_ID
+        _update(session_id, {
+            "sessionUpdate": "config_option_update",
+            "configOptions": _model_config_options(),
+        })
+        _text(session_id, "Falling back now.")
+        _send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}})
+        return
+
     if _MODE == "grandchild":
         _spawn_grandchild()
 
@@ -780,8 +947,12 @@ def main() -> None:
                 continue
             with _record_lock:
                 _record["session_new_params"].append(msg.get("params") or {})
-            _send({"jsonrpc": "2.0", "id": msg["id"],
-                   "result": {"sessionId": _new_session_id()}})
+            _send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+                "sessionId": _new_session_id(),
+                "configOptions": _model_config_options(),
+            }})
+        elif method == "session/set_config_option":
+            _handle_set_config_option(msg)
         elif method == "session/set_mode":
             with _record_lock:
                 _record["set_mode_calls"].append((msg.get("params") or {}).get("modeId"))

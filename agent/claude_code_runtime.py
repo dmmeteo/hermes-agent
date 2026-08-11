@@ -33,10 +33,16 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from agent.claude_acp_binding import BindingStore, TurnLeaseConflict
-from agent.claude_acp_session import ClaudeAcpSession, ClaudeCodeAuthRequired
+from agent.claude_acp_session import (
+    ClaudeAcpModelSelectionError,
+    ClaudeAcpSession,
+    ClaudeCodeAuthRequired,
+)
 
 if TYPE_CHECKING:  # display projection types; no import-time cost
     from agent.transports.claude_acp_event_projector import (
@@ -48,11 +54,21 @@ if TYPE_CHECKING:  # display projection types; no import-time cost
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "ClaudeAcpModelIdentity",
+    "ClaudeAcpModelOption",
+    "ClaudeAcpModelSelectionError",
     "ClaudeCodeAuthRequired",
     "RESEED_MARKER",
     "RUNTIME_LABEL",
+    "claude_acp_display_model",
+    "claude_acp_model_identity",
+    "claude_acp_model_options",
+    "claude_acp_select_model",
+    "claude_acp_session",
+    "claude_acp_usage_model",
     "make_claude_acp_event_bridge",
     "make_claude_acp_permission_bridge",
+    "normalize_claude_model_label",
     "resolve_adapter_argv",
     "run_claude_code_acp_turn",
 ]
@@ -83,6 +99,402 @@ _STDERR_DIAGNOSTIC_LINES = 5
 # routinely emit a whole JSON blob on ONE line, which would then land intact in
 # a Discord/Telegram message. The head of a diagnostic carries the signal.
 _STDERR_DIAGNOSTIC_LINE_CHARS = 500
+
+
+# ---------------------------------------------------------------------------
+# Model identity (Packet 4 slice A).
+#
+# `agent.model` stays the static pseudo-model
+# (`plugins/model-providers/claude-code-acp`'s `"claude-code"`) for this
+# runtime, deliberately. It also drives provider resolution, config
+# persistence, and the gateway's own-model drift check
+# (`gateway/run.py`: `_agent.model != _cfg_model` evicts the cached agent on a
+# successful run unless the switch was user-driven) — mutating it to the live
+# Claude Code model would make every successful turn look like an
+# unintentional provider-level fallback and evict the cached agent every time,
+# destroying adapter/session reuse (Packet 2). The captured identity therefore
+# lives on its own attribute, read through the accessors below rather than by
+# scattering `getattr(agent, "_claude_acp_model_identity", ...)` across every
+# display/usage call site.
+#
+# What that identity IS matters as much as where it lives. ACP reports the
+# session's model as a generic picker's selected value, which is a model id
+# only some of the time — `"default"` and family aliases are ordinary live
+# values. So there are two accessors, and which one a call site wants is a real
+# decision: `claude_acp_display_model()` for anything a human reads, and
+# `claude_acp_usage_model()` for anything keyed on a model (pricing, usage
+# rows, context-window metadata).
+# ---------------------------------------------------------------------------
+
+#: A Claude model id's trailing release-date suffix, e.g. the "-20260815" in
+#: "claude-sonnet-5-20260815". Stripped for display; the exact id is preserved
+#: wherever accounting needs it verbatim. The optional bracketed tail is the
+#: context-lane marker the adapter carries on 1M-context ids
+#: ("claude-sonnet-5-20260815[1m]") — the date is still noise there, the lane
+#: is not, so the date goes and the lane stays.
+_MODEL_LABEL_DATE_SUFFIX_RE = re.compile(r"-\d{8}(?=(?:\[[^\]]*\])?$)")
+_MODEL_LABEL_VENDOR_PREFIX = "claude-"
+
+
+def normalize_claude_model_label(model_id: str) -> str:
+    """A concise display label for a Claude model id.
+
+    ``"claude-sonnet-5-20260815"`` -> ``"sonnet-5"``,
+    ``"claude-sonnet-5-20260815[1m]"`` -> ``"sonnet-5[1m]"``. Strips the vendor
+    prefix and a trailing 8-digit release-date suffix when present; anything
+    else (a picker selector like ``"default"``/``"sonnet"``, or a future id
+    shape that doesn't match) passes through unchanged — a
+    verbatim-but-unshortened label beats inventing one.
+
+    The prefix test folds case, the same way :func:`_is_authoritative_model_id`
+    decides an id *is* one: the two have to agree, or a differently-cased id
+    would be classified as an id and then displayed with ``Claude-`` still on
+    the front. Only the prefix is dropped — the rest of the id keeps the casing
+    the agent sent.
+
+    This shortens an *id*. A selector that is not an id has no id to shorten,
+    and is named by :func:`_selector_label` instead.
+    """
+    value = (model_id or "").strip()
+    if not value:
+        return ""
+    value = _MODEL_LABEL_DATE_SUFFIX_RE.sub("", value)
+    if value.lower().startswith(_MODEL_LABEL_VENDOR_PREFIX):
+        value = value[len(_MODEL_LABEL_VENDOR_PREFIX):]
+    return value or (model_id or "").strip()
+
+
+def _is_authoritative_model_id(value: str) -> bool:
+    """Whether *value* names a Claude model, rather than selecting one.
+
+    ACP reports the session's model as the ``currentValue`` of a generic
+    "model" picker, and the adapter puts its ``ModelInfo.value`` there — which
+    the Claude Agent SDK documents as *possibly an alias*, with the canonical
+    wire id in a separate ``resolvedModel`` field the adapter drops before the
+    wire. On top of that it unconditionally prepends a ``"default"`` row and
+    selects it whenever neither ``ANTHROPIC_MODEL`` nor ``settings.model`` is
+    set, which is the ordinary configuration for anyone using an
+    ``availableModels`` allowlist.
+
+    So ``"default"``, ``"sonnet"`` and ``"opus"`` are all live values that name
+    no model. The vendor prefix is what separates the two: every id the SDK
+    resolves an alias *to* carries it (``sonnet`` -> ``claude-sonnet-5``),
+    dated or not, context-lane suffix or not.
+    """
+    return (value or "").strip().lower().startswith(_MODEL_LABEL_VENDOR_PREFIX)
+
+
+def _advertised_name(option: Dict[str, str]) -> str:
+    """The human-readable name an advertised row actually carries, or ``""``.
+
+    ``ModelInfo.displayName`` is required, so the adapter always sends *a*
+    name — but ``applyAvailableModelsAllowlist``'s no-SDK-match branch sets it
+    to the value itself, which is what an ``availableModels`` entry the SDK
+    resolves nothing for produces. A name that is just the value again names
+    nothing, so it reads the same as a row with no name at all and every
+    consumer of this seam gets one answer for both spellings.
+    """
+    name = (option.get("name") or "").strip()
+    return "" if name == (option.get("value") or "").strip() else name
+
+
+def _option_label(value: str, name: str = "") -> str:
+    """The display label for one advertised value.
+
+    An id is shortened. A selector cannot be — it has no model in it to
+    shorten — so the agent's own display name for that row is used instead
+    (``default`` -> ``Default``, ``sonnet`` -> ``Sonnet 5``), falling back to
+    the token itself, capitalized, when the row carries no name — including the
+    row whose "name" is the value echoed back, which names no more than an
+    absent one does (see :func:`_advertised_name`). What a display surface must
+    never show is the bare token: "the model is ``default``" reads as a model
+    name and is not one.
+    """
+    value = (value or "").strip()
+    if _is_authoritative_model_id(value):
+        return normalize_claude_model_label(value) or value
+    name = _advertised_name({"value": value, "name": name})
+    if name:
+        return name
+    return (value[:1].upper() + value[1:]) if value else ""
+
+
+def _selector_label(agent: Any, selector: str) -> str:
+    """The display label for the value *agent*'s session currently reports.
+
+    Same rule as :func:`_option_label`, with the display name looked up in the
+    list the session advertised — which is where the adapter puts the only
+    human-readable naming a selector ever gets.
+    """
+    selector = (selector or "").strip()
+    if _is_authoritative_model_id(selector):
+        return normalize_claude_model_label(selector) or selector
+    name = ""
+    for option in _known_model_options(agent):
+        if option.get("value") == selector:
+            name = _advertised_name(option)
+            break
+    return _option_label(selector, name)
+
+
+@dataclass(frozen=True)
+class ClaudeAcpModelIdentity:
+    """The Claude Code model state captured for one agent.
+
+    Deliberately not called "the authoritative id": ``model_id`` is whatever
+    the session's model picker reports as selected, which is an authoritative
+    id only when :attr:`is_authoritative` says so (see
+    :func:`_is_authoritative_model_id`).
+    """
+
+    #: Exactly what ACP reported, verbatim — a full model id
+    #: (``"claude-sonnet-5-20260815"``) or a picker selector (``"default"``,
+    #: ``"sonnet"``). Never truncated or normalized: it is what a later pick
+    #: and any wire comparison have to match against.
+    model_id: str
+    #: What display surfaces show (``"sonnet-5"``, or ``"Default"`` for a
+    #: selector that names no model).
+    label: str
+
+    @property
+    def is_authoritative(self) -> bool:
+        """Whether :attr:`model_id` names the model, rather than selecting it.
+
+        The question every *internal* consumer has to ask: an accounting row
+        or a context-window lookup keyed on ``"default"`` is keyed on nothing.
+        """
+        return _is_authoritative_model_id(self.model_id)
+
+
+def claude_acp_model_identity(agent: Any) -> Optional[ClaudeAcpModelIdentity]:
+    """The Claude Code model state captured for *agent*.
+
+    ``None`` before the first completed Claude Code ACP turn, for a non-ACP
+    agent, or when every adapter this runtime has talked to never reported one
+    at all (see ``ClaudeAcpClient.current_model_id``).
+
+    The type check is not defensive noise: these accessors are read from
+    display surfaces shared with every other provider, and a duck-typed stand-in
+    (a test double, a proxy) carrying an attribute of that name must not be able
+    to put itself on another provider's footer.
+    """
+    identity = getattr(agent, "_claude_acp_model_identity", None)
+    return identity if isinstance(identity, ClaudeAcpModelIdentity) else None
+
+
+def claude_acp_display_model(agent: Any) -> Optional[str]:
+    """A concise display label for *agent*'s live Claude Code model, if known.
+
+    The seam every footer/usage/status surface should call in preference to
+    ``agent.model`` for this runtime — see the module-level note above for why
+    ``agent.model`` itself is not the right place to carry this. Anything keyed
+    on a model rather than read by a human wants
+    :func:`claude_acp_usage_model` instead.
+    """
+    identity = claude_acp_model_identity(agent)
+    return identity.label if identity is not None else None
+
+
+def _capture_model_identity(agent: Any, outcome: Any) -> None:
+    """Record the model state this turn ended on, on *agent*, if known."""
+    _record_model_identity(agent, getattr(outcome, "model_id", None))
+
+
+def _record_model_identity(agent: Any, raw: Any) -> Optional[ClaudeAcpModelIdentity]:
+    """Store *raw* as *agent*'s live identity, or leave it alone if unknown.
+
+    One writer for the attribute every display and usage surface reads, whether
+    the id arrived from a completed turn (slice A) or from a user-driven switch
+    (slice B) — which is what makes the footer, ``/usage`` and the TUI's
+    ``session.info`` current the moment a pick lands, with no second mechanism.
+    """
+    if not raw:
+        return claude_acp_model_identity(agent)
+    identity = ClaudeAcpModelIdentity(
+        model_id=raw, label=_selector_label(agent, raw) or raw,
+    )
+    agent._claude_acp_model_identity = identity
+    return identity
+
+
+# ---------------------------------------------------------------------------
+# Model selection (Packet 4 slice B).
+#
+# Provider-like selection with no new user concept: Hermes' own `/model` names
+# the models the LIVE ACP session advertises, and a pick is applied to that same
+# session. Deliberately NOT Hermes' cross-provider switch path — that resolves a
+# route (provider, base_url, credentials, api_mode) and rebuilds the agent,
+# which for this runtime would retire the adapter and the Claude-side session on
+# every pick. The model here is state *inside* the session Hermes is already
+# talking to, so the pick is one protocol call and nothing else moves.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ClaudeAcpModelOption:
+    """One model the live Claude Code session offers."""
+
+    #: Exact value to send back on a pick, verbatim as advertised — a model
+    #: id, or a selector the adapter resolves for itself (``"default"``).
+    model_id: str
+    #: Label for display and for matching what a user types: the id shortened,
+    #: or the advertised name when the value names no model.
+    label: str
+    #: The agent's own human-readable name (e.g. ``"Haiku 4.5"``), or ``""``
+    #: when the row carries none that names anything (see
+    #: :func:`_advertised_name`) — in which case :attr:`label` is all there is
+    #: to show, and a surface must not print the raw value as a second name.
+    name: str
+    #: The agent's optional one-line description, or ``""``.
+    description: str
+    #: Whether this is the model the session is running right now.
+    is_current: bool
+
+
+def claude_acp_session(
+    agent: Any, *, require_connected: bool = True
+) -> Optional[ClaudeAcpSession]:
+    """The ACP session for *agent*, or ``None``.
+
+    ``None`` for a non-Claude-Code agent, before the first turn creates a
+    session, and once one has been closed. By default a session whose adapter is
+    gone (crashed, retired, idle-evicted) reads as ``None`` too, because nothing
+    can be applied to it — pass ``require_connected=False`` to reach what such a
+    session still *remembers*, which is enough to recognise a model as ours
+    without claiming it can be selected right now.
+    """
+    if getattr(agent, "api_mode", None) != "claude_code_acp":
+        return None
+    session = getattr(agent, "_claude_acp_session", None)
+    if session is None or session.closed:
+        return None
+    if require_connected and not session.is_connected():
+        return None
+    return session
+
+
+def _known_model_options(agent: Any) -> List[Dict[str, str]]:
+    """The raw advertised option dicts *agent*'s session can vouch for.
+
+    The live list while an adapter is running, and the list the session
+    remembers once one is gone — the latter is recognition-only (see
+    :func:`claude_acp_model_options`). Raw dicts rather than
+    ``ClaudeAcpModelOption``s: this feeds label construction, which building an
+    option would itself need.
+    """
+    session = claude_acp_session(agent, require_connected=False)
+    if session is None:
+        return []
+    try:
+        if session.is_connected():
+            return session.model_options
+        return session.remembered_model_options
+    except Exception:  # pragma: no cover - a stand-in session missing the seam
+        return []
+
+
+def _known_model_state(session: Any) -> tuple:
+    """``(options, current)`` for *session*: live if connected, else remembered.
+
+    A retired adapter's list is not what the conversation offers *now*, but it
+    is still the only way to recognise one of its models by name — so the two
+    reads are kept apart rather than merged into one field that means both.
+    """
+    if session.is_connected():
+        return session.model_options, session.current_model_id or ""
+    return session.remembered_model_options, session.remembered_model_id or ""
+
+
+def claude_acp_model_options(
+    agent: Any, *, require_connected: bool = True
+) -> "tuple[ClaudeAcpModelOption, ...]":
+    """The models *agent*'s Claude Code session advertises, in its order.
+
+    Empty for anything that is not a live Claude Code session, and empty for a
+    session that advertises no selectable models — an older adapter, or a user
+    ``availableModels`` allowlist that leaves nothing to choose. There is no ACP
+    capability to gate on, so an empty tuple is exactly "no pick is offered
+    here", and every caller treats it as "leave ``/model`` alone".
+
+    ``require_connected=False`` includes the list an idle-evicted session still
+    remembers. Those models are recognisable but not currently selectable; see
+    :func:`claude_acp_session`.
+    """
+    session = claude_acp_session(agent, require_connected=require_connected)
+    if session is None:
+        return ()
+    options, current = _known_model_state(session)
+    return tuple(
+        ClaudeAcpModelOption(
+            model_id=option["value"],
+            label=_option_label(option["value"], _advertised_name(option)),
+            name=_advertised_name(option),
+            description=option.get("description") or "",
+            is_current=option["value"] == current,
+        )
+        for option in options
+    )
+
+
+def claude_acp_select_model(agent: Any, model_id: str) -> ClaudeAcpModelIdentity:
+    """Switch *agent*'s live Claude Code session onto *model_id*.
+
+    Returns the identity now in force — the exact id the session reports after
+    the switch (the agent canonicalises what it applies, so this is not simply
+    the argument echoed back) plus its display label, already recorded where
+    every read-only surface looks.
+
+    Raises ``ClaudeAcpModelSelectionError`` when the pick could not be applied;
+    the session is unchanged on every one of those paths.
+    """
+    session = claude_acp_session(agent)
+    if session is None:
+        raise ClaudeAcpModelSelectionError(
+            "Claude Code has no live session for this conversation yet — send a "
+            "message first, then pick a model."
+        )
+    applied = session.set_model(model_id)
+    identity = _record_model_identity(agent, applied)
+    if identity is None:  # pragma: no cover - set_model returns a real id
+        raise ClaudeAcpModelSelectionError(
+            "Claude Code reported no model after the switch."
+        )
+    return identity
+
+
+def claude_acp_usage_model(agent: Any) -> str:
+    """The model string internal machinery should key on for *agent*.
+
+    Not a display label: this is what prices a turn, keys its
+    ``session_model_usage`` row, and looks up a context window. All three want
+    a model an id-keyed table can be reconciled against, so the rule is
+    explicit rather than "whatever ACP said":
+
+    * the exact id ACP reported, verbatim, whenever it reported one;
+    * otherwise the provider's static pseudo-model (``agent.model``).
+
+    The fallback covers a selector that names no model (``"default"``,
+    ``"sonnet"`` — see :func:`_is_authoritative_model_id`). ACP does not carry
+    the canonical id such a row resolves to, so Hermes cannot recover it, and
+    the choice is between persisting a token that *looks* like a model and is
+    not, and persisting the honest "this session's model was not reported".
+    ``session_model_usage`` exists to attribute tokens per model (issue
+    #51607); a ``"default"`` row attributes them to a fiction. The pseudo-model
+    is also what pre-Packet-4 rows for this provider already carry, so the
+    unresolvable case reconciles with them instead of forking the history.
+
+    Billing is unaffected either way: ``resolve_billing_route`` keys on
+    provider, not model, so a Claude Code turn stays subscription-included.
+    """
+    identity = claude_acp_model_identity(agent)
+    if identity is not None and identity.is_authoritative:
+        return identity.model_id
+    return agent.model
+
+
+def _usage_model_label(agent: Any) -> str:
+    """Backwards-compatible alias for :func:`claude_acp_usage_model`."""
+    return claude_acp_usage_model(agent)
 
 
 def _diagnostics(turn: Any) -> str:
@@ -241,9 +653,12 @@ def make_claude_acp_event_bridge(agent) -> Callable[["ProjectedEvent"], None]:
             _tool_started(event.tool)
         elif kind == "tool_completed":
             _tool_completed(event.tool)
-        # "tool_updated" (a non-terminal status change) and "usage" have no
-        # live Hermes surface: usage is recorded once at turn end, and Hermes'
-        # tool display is a started/completed pair.
+        # "tool_updated" (a non-terminal status change), "usage" and
+        # "model_changed" have no live Hermes surface: usage is recorded once
+        # at turn end, Hermes' tool display is a started/completed pair, and
+        # model identity (Packet 4 slice A) is state capture only — the
+        # session/runtime read it straight off the projector's `model_id`
+        # rather than through this sink; see `_capture_model_identity`.
 
     return sink
 
@@ -451,7 +866,7 @@ def _record_usage(agent, outcome: Any) -> Dict[str, Any]:
     agent.session_reasoning_tokens += canonical.reasoning_tokens
 
     cost_result = estimate_usage_cost(
-        agent.model,
+        _usage_model_label(agent),
         canonical,
         provider=agent.provider,
         base_url=agent.base_url,
@@ -484,7 +899,7 @@ def _queue_token_counts(agent, canonical: Any, cost_result: Any) -> None:
         if canonical is None:
             agent._session_db.queue_token_counts(
                 agent.session_id,
-                model=agent.model,
+                model=_usage_model_label(agent),
                 billing_provider=agent.provider,
                 billing_base_url=agent.base_url,
                 billing_mode="subscription_included",
@@ -506,7 +921,7 @@ def _queue_token_counts(agent, canonical: Any, cost_result: Any) -> None:
             billing_base_url=agent.base_url,
             billing_mode="subscription_included"
             if cost_result.status == "included" else None,
-            model=agent.model,
+            model=_usage_model_label(agent),
             api_call_count=1,
         )
     except Exception as exc:
@@ -640,6 +1055,7 @@ def run_claude_code_acp_turn(
 
     # Streaming ended with this turn: release whatever the scrubbers held back.
     _flush_stream_surface(agent)
+    _capture_model_identity(agent, outcome)
 
     final_text = outcome.text
     stop_reason = outcome.stop_reason

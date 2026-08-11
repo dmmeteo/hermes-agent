@@ -9174,6 +9174,76 @@ def test_session_info_reports_pending_model_switch(monkeypatch):
     assert server._session_info(agent, session)["model"] == "old/model"
 
 
+def test_session_info_prefers_claude_acp_display_model():
+    """Packet 4 slice A: the desktop/TUI footer shows the live Claude Code
+    model, not the static pseudo-model ("claude-code") agent.model carries for
+    this runtime — see agent.claude_code_runtime.claude_acp_display_model."""
+    from agent.claude_code_runtime import ClaudeAcpModelIdentity
+
+    agent = types.SimpleNamespace(
+        tools=[], model="claude-code", provider="claude-code-acp",
+        _claude_acp_model_identity=ClaudeAcpModelIdentity(
+            model_id="claude-sonnet-5-20260815", label="sonnet-5",
+        ),
+    )
+
+    info = server._session_info(agent, {"session_key": "", "history": []})
+
+    assert info["model"] == "sonnet-5"
+
+
+def test_session_info_shows_a_picker_selector_by_name():
+    """``configOptions``' ``currentValue`` is the adapter's picker selector,
+    and it is ``"default"`` whenever the user has an ``availableModels``
+    allowlist and no model override — a token that names no model. Recorded
+    through the real writer so this asserts the production label."""
+    from agent.claude_code_runtime import _record_model_identity
+
+    agent = types.SimpleNamespace(
+        tools=[], model="claude-code", provider="claude-code-acp",
+        api_mode="claude_code_acp", _claude_acp_session=None,
+    )
+    _record_model_identity(agent, "default")
+
+    info = server._session_info(agent, {"session_key": "", "history": []})
+
+    assert info["model"] == "Default"
+
+
+def test_session_info_falls_back_to_pseudo_model_before_any_identity():
+    agent = types.SimpleNamespace(
+        tools=[], model="claude-code", provider="claude-code-acp",
+    )
+
+    info = server._session_info(agent, {"session_key": "", "history": []})
+
+    assert info["model"] == "claude-code"
+
+
+def test_session_info_pending_model_switch_still_wins_over_claude_acp_label():
+    """A queued /model switch is a more specific, more recent signal than a
+    captured live identity from before the switch was requested."""
+    from agent.claude_code_runtime import ClaudeAcpModelIdentity
+
+    agent = types.SimpleNamespace(
+        tools=[], model="claude-code", provider="claude-code-acp",
+        _claude_acp_model_identity=ClaudeAcpModelIdentity(
+            model_id="claude-sonnet-5-20260815", label="sonnet-5",
+        ),
+    )
+    session = {
+        "session_key": "", "history": [],
+        "pending_model_switch": {
+            "raw": "new/model", "display_model": "new/model",
+            "display_provider": "anthropic",
+        },
+    }
+
+    info = server._session_info(agent, session)
+
+    assert info["model"] == "new/model"
+
+
 # ---------------------------------------------------------------------------
 # History-mutating commands must reject while session.running is True.
 # Without these guards, prompt.submit's post-run history write either

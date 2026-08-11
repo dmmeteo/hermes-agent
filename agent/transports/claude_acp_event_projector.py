@@ -54,11 +54,15 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ClaudeAcpEventProjector",
+    "MODEL_CONFIG_OPTION_ID",
     "PermissionRequest",
     "ProjectedEvent",
     "ToolActivity",
     "UsageSnapshot",
     "deterministic_call_id",
+    "extract_current_model_id",
+    "extract_model_options",
+    "has_model_config_option",
     "project_permission_request",
 ]
 
@@ -67,6 +71,125 @@ TERMINAL_TOOL_STATUSES = frozenset({"completed", "failed"})
 
 #: The only update kind whose text is the assistant's reply.
 ASSISTANT_TEXT_UPDATE = "agent_message_chunk"
+
+#: The ``id`` the pinned adapter gives its model selector in ``configOptions``
+#: (``MODEL_CONFIG_ID`` in ``dist/acp-agent.js``). ACP has no dedicated
+#: "current model" field: the adapter reports it as this option's
+#: ``currentValue`` on ``session/new``, ``session/load`` AND every later
+#: ``config_option_update`` — including one it sends on its own, unprompted,
+#: after an SDK-side refusal fallback (``syncModelAfterRefusalFallback``
+#: re-uses the exact same ``config_option_update`` path a user-driven switch
+#: takes). One extractor, shared with the wire client's ``current_model_id``
+#: (``agent/transports/claude_acp.py``), covers the initial identity and every
+#: live change including that automatic one.
+MODEL_CONFIG_OPTION_ID = "model"
+
+
+def extract_current_model_id(config_options: Any) -> Optional[str]:
+    """The model selector a ``configOptions`` list reports, or ``None``.
+
+    ``config_options`` is the raw, un-typed ``SessionConfigOption`` list ACP
+    carries on ``session/new``'s and ``session/load``'s responses and on every
+    ``config_option_update`` — identical shape in all three, so one function
+    reads it everywhere it can appear. Returns ``None`` for anything that
+    is not a well-formed match: an older adapter that never reports a model
+    option, a malformed entry, or the list missing entirely.
+
+    **This is the picker's selected value, not necessarily a model id.** The
+    adapter maps only ``ModelInfo.value`` onto the wire and drops
+    ``resolvedModel`` (the canonical id an alias resolves to), and it always
+    prepends a ``"default"`` row it also selects when the user set no model —
+    so ``"default"`` and family aliases like ``"sonnet"`` are ordinary live
+    values here. ``agent/claude_code_runtime.py`` is where that distinction is
+    interpreted (display name vs accounting key); this function only reads.
+    """
+    option = _model_config_option(config_options)
+    if option is None:
+        return None
+    value = option.get("currentValue")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _model_config_option(config_options: Any) -> Optional[Dict[str, Any]]:
+    """The "model" entry of a ``configOptions`` list, or ``None``."""
+    if not isinstance(config_options, list):
+        return None
+    for option in config_options:
+        if isinstance(option, dict) and option.get("id") == MODEL_CONFIG_OPTION_ID:
+            return option
+    return None
+
+
+def has_model_config_option(config_options: Any) -> bool:
+    """Whether this response carried a model selector at all.
+
+    The companion question to :func:`extract_model_options`, and a different
+    one: an empty list means "this session advertises no selectable model",
+    while a missing entry means "this response says nothing about models".
+    A reconnect must not read the second as the first — the previous adapter's
+    list is not evidence about the one now answering (see
+    ``ClaudeAcpSession._capture_model_state``).
+    """
+    return _model_config_option(config_options) is not None
+
+
+def extract_model_options(config_options: Any) -> List[Dict[str, str]]:
+    """Every model this session advertises as selectable, in the agent's order.
+
+    The write-side companion to :func:`extract_current_model_id`, reading the
+    same "model" entry's ``options`` instead of its ``currentValue`` (Packet 4
+    slice B). The adapter builds that list from ``models.availableModels``,
+    which the user's own Claude ``availableModels`` allowlist already filtered
+    — so treating it as the whole truth is what keeps a Hermes-side pick inside
+    the adapter's policy instead of second-guessing it.
+
+    ACP allows the list to be *grouped* (``SessionConfigSelectOptions``), so
+    groups are flattened exactly as the adapter flattens them when validating a
+    requested value. Returns ``[]`` for an agent that advertises no selectable
+    model at all — the only gate available, since ACP publishes no capability
+    for this and adapter 0.66.0 advertises none.
+
+    ``name`` is ``""`` for a row that carries none, rather than the value copied
+    into it: "this row has no human-readable name" is the fact a display surface
+    needs (``_option_label`` names the token instead of showing it bare), and a
+    name substituted here is one it cannot tell apart from a real one. Like the
+    rest of this module, this function reads the wire and interprets nothing.
+    """
+    option = _model_config_option(config_options)
+    if option is None:
+        return []
+    raw = option.get("options")
+    if not isinstance(raw, list):
+        return []
+    flattened: List[Any] = []
+    for entry in raw:
+        if isinstance(entry, dict) and isinstance(entry.get("options"), list):
+            flattened.extend(entry["options"])
+        else:
+            flattened.append(entry)
+    out: List[Dict[str, str]] = []
+    seen: set = set()
+    for entry in flattened:
+        if not isinstance(entry, dict):
+            continue
+        value = entry.get("value")
+        if not isinstance(value, str) or not value.strip():
+            continue
+        value = value.strip()
+        if value in seen:
+            continue
+        seen.add(value)
+        name = entry.get("name")
+        description = entry.get("description")
+        out.append({
+            "value": value,
+            "name": name.strip() if isinstance(name, str) else "",
+            "description": (
+                description.strip() if isinstance(description, str) else ""
+            ),
+        })
+    return out
+
 
 # Display bounds. A single tool result can be a whole file; a messaging
 # platform must not receive it, and neither must a progress bubble.
@@ -492,6 +615,12 @@ class ProjectedEvent:
     text: str = ""
     tool: Optional[ToolActivity] = None
     usage: Optional[UsageSnapshot] = None
+    #: Set only for ``kind == "model_changed"`` — the model value
+    #: ``config_option_update`` just reported (an id or a picker selector; see
+    #: ``extract_current_model_id``). State capture only: this has no
+    #: display surface of its own (see ``claude_code_runtime.py``'s event
+    #: bridge), it exists so ``ClaudeAcpSession`` can keep its identity current.
+    model_id: str = ""
 
 
 _IGNORED = ProjectedEvent(kind="ignored")
@@ -515,6 +644,11 @@ class ClaudeAcpEventProjector:
         self._declared_names: Dict[str, str] = {}
         self.tool_iterations = 0
         self.usage: Optional[UsageSnapshot] = None
+        #: Last model id a ``config_option_update`` reported during THIS turn,
+        #: or ``None`` if none arrived. ``ClaudeAcpSession`` is what carries
+        #: identity ACROSS turns — a fresh projector starting at ``None`` here
+        #: just means "no change was reported this turn", not "no model known".
+        self.model_id: Optional[str] = None
 
     # ---------- accumulated turn state ----------
 
@@ -550,11 +684,13 @@ class ClaudeAcpEventProjector:
             return self._project_tool_call_update(update)
         if kind == "usage_update":
             return self._project_usage(update)
+        if kind == "config_option_update":
+            return self._project_config_option_update(update)
         # Deliberately ignored, and deliberately the default: user_message_chunk
         # (our own prompt echoed back, or history a session/load replayed),
         # plan/plan_update, available_commands_update, session_info_update,
-        # current_mode_update, config_option_update, and anything a future
-        # adapter version adds. None of it is the assistant's reply.
+        # current_mode_update, and anything a future adapter version adds.
+        # None of it is the assistant's reply.
         return _IGNORED
 
     # ---------- per-kind ----------
@@ -708,6 +844,29 @@ class ClaudeAcpEventProjector:
         # session's occupancy, so the final one is the current truth.
         self.usage = snapshot
         return ProjectedEvent(kind="usage", usage=snapshot)
+
+    def _project_config_option_update(self, payload: Dict[str, Any]) -> ProjectedEvent:
+        """State capture only (Packet 4 slice A) — never a display event.
+
+        ``config_option_update`` fires on ANY session config change (mode,
+        effort, Fast mode, model) and always restates the full list, so a
+        change unrelated to the model still carries the model's current
+        (unchanged) value here. Deduping against ``self.model_id`` collapses
+        those restatements *within a turn*.
+
+        The dedupe is per-turn only, and deliberately so: a projector is built
+        per turn and starts knowing nothing, so the FIRST update of a turn
+        always projects, even when it restates the model the session was
+        already running. That costs nothing — ``model_changed`` has no display
+        surface and the session writes back the value it already held — and
+        seeding the projector from the session would trade a real coupling for
+        no behavioural gain.
+        """
+        model_id = extract_current_model_id(payload.get("configOptions"))
+        if not model_id or model_id == self.model_id:
+            return _IGNORED
+        self.model_id = model_id
+        return ProjectedEvent(kind="model_changed", model_id=model_id)
 
 
 def _coerce_int(value: Any) -> int:

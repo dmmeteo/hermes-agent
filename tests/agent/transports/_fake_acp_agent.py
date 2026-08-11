@@ -7,7 +7,15 @@ mocks. Deliberately NOT named ``test_*`` so pytest does not collect it.
 Behaviour is driven entirely by the methods the client sends:
 
 ``initialize``      -> protocolVersion 1 + a small capability set
-``session/new``     -> a fixed session id
+``session/new``     -> a fixed session id, plus a ``configOptions`` "model"
+                       entry (Packet 4 slice A: the authoritative model id)
+                       carrying two selectable ``options`` (slice B)
+``session/set_config_option``
+                    -> switches the "model" entry's ``currentValue`` and
+                       replies with the whole refreshed ``configOptions``
+                       list, rejecting an unknown option id or a value the
+                       list never advertised — the same three outcomes
+                       adapter 0.66.0's ``setSessionConfigOption`` produces
 ``session/prompt``  -> streams two ``session/update`` notifications, then
                        issues an ``fs/read_text_file`` request back at the
                        client, echoes whatever the client answered as a
@@ -27,6 +35,25 @@ _cancelled = threading.Event()
 _pending_client_replies: dict[int, dict] = {}
 _replies_lock = threading.Lock()
 _reply_ready = threading.Condition(_replies_lock)
+
+# The session's model state (Packet 4 slice A/B). ACP carries it inside the
+# generic `configOptions` list — `currentValue` is the authoritative model id,
+# `options` the models this session advertises as selectable.
+_MODEL_OPTIONS = [
+    {"value": "claude-sonnet-5-20260815", "name": "Sonnet 5"},
+    {"value": "claude-haiku-4-5-20251001", "name": "Haiku 4.5"},
+]
+_current_model = _MODEL_OPTIONS[0]["value"]
+
+
+def _config_options() -> list[dict]:
+    return [{
+        "id": "model",
+        "name": "Model",
+        "type": "select",
+        "currentValue": _current_model,
+        "options": list(_MODEL_OPTIONS),
+    }]
 
 
 def _send(obj: dict) -> None:
@@ -89,6 +116,7 @@ def _handle_prompt(msg: dict) -> None:
 
 
 def main() -> None:
+    global _current_model
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -114,7 +142,36 @@ def main() -> None:
                 "authMethods": [],
             }})
         elif method == "session/new":
-            _send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": "sess-1"}})
+            _send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+                "sessionId": "sess-1",
+                # Mirrors the real adapter's `configOptions`, which always
+                # carries a "model" entry (Packet 4 slice A) — the only place
+                # ACP exposes the session's authoritative model id.
+                "configOptions": _config_options(),
+            }})
+        elif method == "session/set_config_option":
+            params = msg.get("params") or {}
+            config_id = params.get("configId")
+            value = params.get("value")
+            if config_id != "model":
+                _send({"jsonrpc": "2.0", "id": msg["id"], "error": {
+                    "code": -32603,
+                    "message": f"Unknown config option: {config_id}",
+                }})
+                continue
+            if value not in [o["value"] for o in _MODEL_OPTIONS]:
+                _send({"jsonrpc": "2.0", "id": msg["id"], "error": {
+                    "code": -32603,
+                    "message": f"Invalid value for config option model: {value}",
+                }})
+                continue
+            _current_model = value
+            # The real adapter answers the RPC with the refreshed list and
+            # does NOT also notify — `config_option_update` is reserved for
+            # changes the client did not ask for (the refusal fallback).
+            _send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+                "configOptions": _config_options(),
+            }})
         elif method == "session/set_mode":
             # Echo the requested mode so the client can assert on it.
             _send({"jsonrpc": "2.0", "id": msg["id"], "result": {

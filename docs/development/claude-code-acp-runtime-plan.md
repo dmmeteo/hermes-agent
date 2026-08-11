@@ -13,6 +13,10 @@ Packet 3 was reviewed independently
 ([review](2026-08-10-claude-code-acp-packet3-review.md)) and its four required
 fixes plus two recommendations landed in a follow-up pass
 ([fixes report](2026-08-10-claude-code-acp-packet3-fixes-report.md)).
+Packet 4 **slices A (model identity capture/display) and B (user-driven model
+selection through `/model`) complete** — picks up Packet 1's R10 ("pseudo-model
+`claude-code` is a placeholder"), left open through Packet 3. See the Packet 4
+section below.
 
 Transcript-level tool rows (3A's R2) remain the one deferred Packet 3 item, and
 "deferred" has a concrete cost worth stating rather than closing by silence:
@@ -323,6 +327,374 @@ lease.
 **Stop condition.** Stop and report if permission requests cannot be delivered
 through the gateway guards without a synthetic mid-loop user message — that
 would break message-role alternation.
+
+---
+
+## Packet 4 — Model identity and selection
+
+**Goal.** Hermes' runtime/usage/footer surfaces show the model Claude Code is
+*actually* running, not the static pseudo-model
+(`plugins/model-providers/claude-code-acp`'s `"claude-code"`) carried since
+Packet 1. Packet 1's R10 named this a placeholder and suggested projecting
+`session_info_update` in Packet 3; that never landed (`session_info_update`
+turns out to be the wrong message — see slice A below for the one that
+actually carries it), so the gap survived through Packet 3 unaddressed.
+
+Slice A makes Hermes *observe* that model; slice B lets the user *pick* it from
+the live session's own advertised list through the ordinary `/model` command, on
+every surface. Both read the same ACP mechanism (`configOptions`) and land in
+the same captured identity, so a pick is visible on the footer/usage surfaces
+immediately and no second mechanism exists to keep in sync.
+
+### Slice A — state capture / display / usage identity ✅ COMPLETE
+
+**Scope.**
+- Capture the model state ACP reports and keep it current for the life of a
+  Hermes conversation, surviving reconnects and adapter restarts.
+- Replace the pseudo-model on read-only display/usage surfaces: the CLI
+  status-bar footer, `/usage`'s "Model:" line, the desktop/TUI gateway's
+  `session.info` `"model"` field, and (added when slice B gave the gateway a
+  `/model`) the messaging gateway's `/usage`, `/context` and `/agents`.
+- Preserve verbatim whatever ACP reported, and key internal accounting
+  (SessionDB usage rows, pricing, context-window metadata) on the model id
+  *when ACP reported an id*, while showing a concise normalized label (e.g.
+  `sonnet-5` for `claude-sonnet-5-20260815`) on the display surfaces above.
+  See "The selector is not always an id" below for the case where it did not.
+- Capture automatic, adapter-driven model changes (the Claude Agent SDK's own
+  refusal-fallback) the same way as any other identity update — no separate
+  mechanism, since the wire gives none.
+
+**Non-scope.** User-driven model switching and `/model` UX for this provider
+(slice B) — nothing in slice A lets Hermes pick or change the underlying
+model, only observe it. Hermes' own cross-provider `_try_activate_fallback` /
+`fallback_model` chain gaining a `claude_code_acp` branch (its `fb_api_mode`
+table has none today) — a separate, larger change to a different mechanism,
+left for whichever packet actually wires Claude Code into a fallback chain.
+Mutating `agent.model` itself — see the safety invariant below for why that
+is not merely deferred but actively wrong for this runtime.
+
+**What ACP actually exposes, and why the obvious approach doesn't apply.**
+ACP has no dedicated "current model" field or change notification. The
+`acp` schema's `NewSessionResponse.models` (`SessionModelState` /
+`currentModelId`) exists but the pinned adapter
+(`@agentclientprotocol/claude-agent-acp@0.66.0`) does not populate it —
+confirmed by reading `dist/acp-agent.js`'s `createSession()`, whose actual
+return is `{ sessionId, modes, configOptions }`, no `models` key. The
+identity travels instead inside the generic `configOptions` list (`select`
+options for mode/model/effort/fast-mode), in the entry with `id: "model"`,
+whose `currentValue` is the value that entry's *picker* currently has selected
+(`buildConfigOptions` / `MODEL_CONFIG_ID` in `dist/acp-agent.js`) — a model id
+much of the time, but not always one; see "The selector is not always an id".
+`configOptions` is present on `session/new`'s and `session/load`'s responses
+**and** on every `config_option_update` notification — and critically, the
+adapter's own SDK-side refusal fallback
+(`syncModelAfterRefusalFallback`) re-uses that exact same
+`config_option_update` path a user-driven `/model` switch would take, so one
+extractor, read at both the response and the notification, covers the
+initial identity, a resumed session's identity, a manual switch, and an
+automatic one — with no separate "fallback happened" signal to build against.
+`extract_current_model_id()` in `agent/transports/claude_acp_event_projector.py`
+is that one extractor, shared by the wire client's `current_model_id`
+property and the projector's `config_option_update` handling.
+
+**The selector is not always an id.** The first pass through this treated
+`currentValue` as the authoritative model id everywhere — display *and*
+accounting. Re-reading the adapter and the SDK together shows it is the
+picker's selected *value*, and in the most ordinary configuration that value
+is literally `"default"`:
+
+- `ModelInfo.value` is documented as possibly an alias, with the canonical
+  wire id in a separate `resolvedModel` field
+  (`@anthropic-ai/claude-agent-sdk`'s `sdk.d.ts`) — and `buildConfigOptions`
+  maps only `value`/`name`/`description` onto ACP, so `resolvedModel` never
+  leaves the adapter. Hermes cannot recover it.
+- `applyAvailableModelsAllowlist` unconditionally prepends a `"default"` row,
+  and `getAvailableModels` selects `models[0]` whenever neither
+  `ANTHROPIC_MODEL` nor `settings.model` is set — i.e. for any user with an
+  `availableModels` allowlist and no explicit model, which is exactly the
+  configuration slice B's allowlist story rests on.
+
+So the identity carries the raw value verbatim (a pick and any wire comparison
+need it) plus an `is_authoritative` predicate, and the two consumers diverge:
+
+- **Display** (`claude_acp_display_model`) shows the id shortened when it is an
+  id, and otherwise the *name* the session advertised for that row (`default` →
+  `Default`, `sonnet` → `Sonnet 5`), never the bare token — "the model is
+  `default`" reads as a model name and is not one. A row that names nothing gets
+  the token capitalized instead, and "names nothing" covers both spellings the
+  wire can produce: no `name` at all, and a `name` that is the value echoed back
+  (`applyAvailableModelsAllowlist`'s no-SDK-match branch sets `displayName` to
+  the value, so this is the *reachable* one). `extract_model_options()` reports
+  an absent name as `""` rather than substituting the value, and
+  `_advertised_name()` is the single place both spellings collapse — without
+  that, the fallback would be unreachable from the wire and the invariant only
+  aspirational.
+- **Accounting** (`claude_acp_usage_model`, feeding the cost estimator, the
+  `session_model_usage` row and `/context`'s window lookup) uses the id when
+  there is one and otherwise falls back to `agent.model`, the provider's
+  pseudo-model. Persisting `"default"` as though it were a model would invent a
+  row nothing can be reconciled against — the opposite of what per-model
+  attribution (issue #51607) exists for — while the pseudo-model is both honest
+  ("not reported") and the value pre-Packet-4 rows for this provider already
+  carry. Billing is unaffected either way: `resolve_billing_route` keys on
+  provider.
+
+**Why `agent.model` was not the answer.** The obvious fix — set `agent.model`
+to the live identity — was tried on paper and rejected: `cli.py`'s status bar
+already prefers `agent.model` over the CLI's own configured value specifically
+because *other* providers' `_try_activate_fallback()` mutates it in place, so
+mirroring that would have looked consistent. But `gateway/run.py` runs a
+post-turn check on every successful messaging-platform turn —
+`_agent.model != _cfg_model` evicts the cached agent (forcing a respawn) unless
+`_is_intentional_model_switch()` recognizes an active `/model` override. A
+Claude Code turn's `agent.model` would then differ from the configured
+`"claude-code"` on *every single turn* once real identity landed, which is not
+an intentional switch by that check's definition — so every successful
+gateway/Discord/Telegram turn would evict and respawn the adapter, destroying
+Packet 2's session/process reuse. The identity therefore lives on its own
+attribute (`agent._claude_acp_model_identity`, a frozen `ClaudeAcpModelIdentity`
+carrying both the exact `model_id` and the normalized `label`), read through
+`claude_acp_model_identity()` / `claude_acp_display_model()` in
+`agent/claude_code_runtime.py` rather than by touching `agent.model` at all.
+
+**Seams landed.**
+
+| Seam | File | What it does |
+|---|---|---|
+| Wire capture | `agent/transports/claude_acp.py` | `session_new()` / `session_load()` stash the response's `configOptions`; `ClaudeAcpClient.current_model_id` reads the "model" entry back out |
+| Shared extractor | `agent/transports/claude_acp_event_projector.py` | `extract_current_model_id()` — one function, used by the wire client and by... |
+| Live-change projection | `agent/transports/claude_acp_event_projector.py` | `ClaudeAcpEventProjector._project_config_option_update()` — a `config_option_update` whose model entry changed value projects as `kind="model_changed"`; a restatement (an unrelated mode/effort change re-sends the same value) is deduped and ignored *within a turn* — the projector is per-turn and starts empty, so the first update of a turn projects even if it restates the current model, which costs nothing (no display surface; the session writes back the value it held) |
+| Session-lifetime identity | `agent/claude_acp_session.py` | `ClaudeAcpSession._current_model_id` / `.current_model_id` — the LIVE adapter's answer: re-seeded unconditionally at every `_connect()` from that connection's own response, updated in `run_turn()` from the projector, dropped in `_drop_client()` with the adapter that reported it; `AcpTurnOutcome.model_id` carries it out per turn. `_remembered_model_id` / `_remembered_model_options` keep the last reported state for *recognition* after teardown (slice B's idle-adapter refusal), and are never offered as a live list |
+| Normalization + accessors | `agent/claude_code_runtime.py` | `normalize_claude_model_label()` (strips the `claude-` vendor prefix and a trailing 8-digit release-date suffix, keeping a `[1m]` context-lane marker), `_is_authoritative_model_id()` / `_option_label()` / `_selector_label()` (id vs picker selector — see above), `ClaudeAcpModelIdentity` (`.model_id` verbatim, `.label`, `.is_authoritative`), `claude_acp_model_identity(agent)`, `claude_acp_display_model(agent)`, captured post-turn by `_capture_model_identity()` |
+| Usage accounting | `agent/claude_code_runtime.py` | `claude_acp_usage_model()` (still reachable as `_usage_model_label()`) feeds the exact raw id — not the normalized label — to `estimate_usage_cost()` and both `_queue_token_counts()` call sites, falling back to `agent.model` (`"claude-code"`) before any identity is known AND when the reported value is a selector rather than an id |
+| Gateway displays | `gateway/slash_commands.py` | `_display_model_for()` / `_metadata_model_for()` — the same preference on `/usage`, `/context` and `/agents`; `/context` sizes its window from the accounting id, not the label. Added with slice B, which is what gave the gateway a `/model` to disagree with |
+| CLI footer | `cli.py` (`_get_status_bar_snapshot`) | Prefers `claude_acp_display_model(agent)` ahead of `agent.model`/`self.model` |
+| CLI usage report | `cli.py` (`_show_usage`) | Same preference for the "Model:" line |
+| Desktop/TUI footer | `tui_gateway/server.py` (`_session_info`) | Same preference, ordered after a pending `/model` switch (more specific and more recent) but ahead of the mirror/agent fallback |
+
+The event bridge (`make_claude_acp_event_bridge`'s `sink()`) gets a
+`model_changed` no-op branch alongside `tool_updated`/`usage`: this is state
+capture only, and deliberately produces no chat bubble or approval-style
+prompt — the session/runtime read the identity straight off
+`AcpTurnOutcome.model_id` rather than through the display bridge, keeping
+slice A's "no new user-facing UX" boundary structural rather than a
+convention someone has to remember.
+
+**Acceptance checks.**
+1. After one completed turn, `claude_acp_display_model(agent)` returns the
+   concise normalized label and `claude_acp_model_identity(agent).model_id`
+   is exactly what ACP reported, unmodified — whether that is a model id or a
+   picker selector, with `.is_authoritative` saying which.
+2. `agent.model` is bit-for-bit unchanged by a Claude Code turn.
+3. A mid-turn `config_option_update` reporting a new model (the adapter's own
+   refusal fallback) updates both the display label and the raw id, with no
+   new callback fired on any Hermes display surface.
+4. SessionDB usage rows and the cost estimator receive the exact raw
+   authoritative id, not `"claude-code"`, once one is known — asserted on the
+   persisted `session_model_usage` row, not only on the estimator's argument.
+   When ACP reported a selector rather than an id, they receive the
+   pseudo-model instead and never the selector. The turn is priced
+   `cost_status == "included"` in both cases (`resolve_billing_route` keys on
+   `provider`, not `model` — confirmed unaffected).
+5. The CLI status bar, CLI `/usage`, the desktop/TUI `session.info.model`
+   field and the gateway's `/usage` / `/context` / `/agents` all show the
+   label once known, and the unchanged pseudo-model beforehand or on a non-ACP
+   agent. The label is never a bare picker token (`default`).
+6. Existing Packet 0–3 suites (312 tests across
+   `tests/agent/test_claude_code_*.py`,
+   `tests/agent/transports/test_claude_acp*.py`,
+   `tests/gateway/test_claude_code_acp_approval_guards.py`,
+   `tests/hermes_cli/test_claude_code_acp_*.py`) stay green — this slice adds
+   a new attribute and new read sites, and touches no existing call's
+   behavior for a non-Claude-Code agent.
+
+**Safety invariants.** `agent.model` is never mutated by this runtime (see
+above — it is a correctness requirement, not a style choice: gateway agent
+caching keys eviction off it). Prompt caching, role alternation, credential
+redaction, session continuity and every other provider are unaffected — the
+only new reads are additive `getattr`/property lookups guarded by `try/except`
+at each display call site, so a lookup failure degrades to the pre-Packet-4
+behavior rather than breaking the surface it touches.
+
+**Stop condition.** Met — no blocker: the mechanism ACP actually offers
+(`configOptions`) covers every case slice A needed (initial identity, resumed
+identity, automatic change), which the earlier `session_info_update` guess
+would not have.
+
+### Slice B — user-driven model selection ✅ COMPLETE
+
+**Goal.** Selecting which model Claude Code runs is provider-like and lives in
+Hermes' existing `/model`, on every surface that has one. No new command, no
+new user concept, and no adapter restart: the pick is applied to the ACP
+session already serving the conversation.
+
+**Scope.**
+- List the models the **live ACP session** actually advertises, mark the one
+  it is running, and offer nothing when it advertises none.
+- Apply a pick with `session/set_config_option` on that same session — same
+  adapter process, same ACP session id, same binding, same negotiated roots and
+  permission mode.
+- Wire it into `/model` on the CLI and the Discord/Telegram gateway through one
+  shared seam, so the two cannot drift and neither grows a platform-specific
+  command.
+- Let slice A's captured identity carry the result: the footer, `/usage` and the
+  desktop/TUI `session.info.model` are current the moment the pick lands.
+
+**Non-scope.** The effort / permission-mode / agent selectors the same
+`configOptions` list carries (`session/set_config_option` is generic; only the
+`model` option is wired, and the wire client's docstring says why the
+permission mode must keep going through `set_mode` instead). Persisting a pick
+across conversations — see the scope-flag decision below. The desktop/TUI's own
+`/model` surface (`tui_gateway`'s queued `pending_model_switch`, a turn-boundary
+mechanism of its own); its footer already follows a pick made elsewhere via
+slice A. **That divergence has a user-visible consequence worth stating rather
+than leaving implicit:** the same words (`/model haiku-4-5`) switch in place on
+the CLI and the messaging gateway, and on the desktop/TUI take the route-switch
+path — which moves the conversation off Claude Code entirely and retires the
+adapter. The "the two cannot drift" claim below is about the two surfaces this
+slice wires, not all three. Hermes' cross-provider `_try_activate_fallback`
+chain, unchanged from slice A's non-scope note.
+
+**The wire, corrected.** Slice A's stub for this slice named
+`availableModels` + `session/set_model`; both were wrong for the pinned adapter,
+and re-reading `dist/acp-agent.js` (0.66.0) before writing anything is what
+found it. `SessionModelState` / `session/set_model` are **UNSTABLE** in the ACP
+schema *and* unpopulated by this adapter — the same reason slice A had to read
+`configOptions`. Selection travels through the same generic option: the "model"
+entry's `options` list (`buildConfigOptions`, from `models.availableModels`),
+written with **`session/set_config_option`** — params `{sessionId, configId,
+value}` (note `configId`, not `optionId`), reply `{configOptions}` carrying the
+whole refreshed list. The adapter canonicalises the value it applies
+(`resolveModelPreference` accepts aliases), so the reply is read back rather
+than the request assumed, and unlike its own refusal fallback the RPC path
+sends **no** accompanying `config_option_update` — so a user-driven pick and an
+automatic one stay distinguishable while both land in the same captured state.
+
+**Capability gating, answered.** There is no ACP capability for this: adapter
+0.66.0's `initialize` advertises none, and the client capability that exists
+(`session.configOptions.boolean`) is about boolean options, not model
+selection. The gate is therefore **the advertised list itself** — an empty
+`options` list means no pick is offered here, on both the read and the write
+path. That also answers the allowlist question slice A left open: the list the
+adapter advertises is already filtered by the user's own
+`~/.claude/settings.json` `availableModels`, so honouring it verbatim keeps a
+Hermes-side pick inside the adapter's policy instead of second-guessing it.
+
+**Scope flags, decided.** `--global` / `--once` are **refused by name**, not
+silently ignored. A Claude Code pick is state inside the live ACP session, and
+Hermes has nowhere to persist it as a *route*: `model.default` must stay the
+provider's pseudo-model or provider resolution and the gateway's agent-cache
+drift check both break (slice A's core finding). Bare `/model <name>` and
+`--session` are the supported forms, and the copy says the pick applies to this
+conversation.
+
+**Fall-through is the safety property, up to the point of recognition.** The
+seam answers only what it owns and returns `None` otherwise — a non-Claude-Code
+agent, a conversation with no session yet, a live session that reports no model
+state at all, `--provider <slug>` (the way *out* of Claude Code), and any name
+this session does not advertise, so `/model gpt-5.5` from a Claude Code session
+still switches provider exactly as before. Both call sites also wrap the seam in
+`try/except` and fall through on any fault, so a fault raised *before* the seam
+recognises the name degrades to the pre-slice-B behaviour.
+
+Past that point the seam deliberately does **not** fall through: once the name
+is known to be one of this session's models, an internal fault is caught inside
+the seam and answered as a refusal (`hermes_cli/claude_acp_model_select.py`'s
+broad `except Exception`), so the call sites' `try/except` never sees it. That
+is the safer of the two: falling through with a name we know is a Claude Code
+model would hand it to the cross-provider resolver, silently moving the
+conversation and its billing route to another provider. Refusing says the switch
+did not happen, which is true.
+
+**One exception to fall-through, and why.** Packet 2 retires an adapter that
+crashed, was replaced, or simply went **idle** (`IDLE_TTL_SECONDS`), leaving the
+session object alive and still remembering the list it advertised. A pick cannot
+be applied there — the model is state inside the adapter — but falling through
+with a name we *know* is a Claude Code model would silently move the
+conversation, and its billing route, onto another provider. So a recognised name
+is refused with "send a message first, then pick a model", an unrecognised one
+still falls through, and a bare `/model` still opens the ordinary picker rather
+than presenting a stale list as live. Before the very first turn nothing is
+remembered, so a Claude Code model is indistinguishable from any other name and
+`/model` behaves exactly as it always did — the only non-guessing option there.
+
+**Seams landed.**
+
+| Seam | File | What it does |
+|---|---|---|
+| Advertised-list extractor | `agent/transports/claude_acp_event_projector.py` | `extract_model_options()` — the "model" entry's `options`, groups flattened as the adapter flattens them; sibling of slice A's `extract_current_model_id()`, sharing one `_model_config_option()` finder. Reports a missing `name` as `""` (the fact display code needs) rather than copying the value into it |
+| Wire read | `agent/transports/claude_acp.py` | `ClaudeAcpClient.available_model_options` — `None` when the last session response carried no model entry at all, `[]` when it carried one advertising nothing. Two different facts, and a reconnect has to tell them apart (`has_model_config_option()` is the predicate) |
+| Wire write | `agent/transports/claude_acp.py` | `ClaudeAcpClient.set_config_option()` — issues `session/set_config_option` and replaces the local `configOptions` capture from the reply; a rejection raises and updates nothing |
+| Session state | `agent/claude_acp_session.py` | `model_options` / `remembered_model_options` / `turn_in_flight` / `set_model()`, plus `_capture_model_state()` — one place that refreshes identity **and** option list from a response, used by `_connect()` too, and re-seeding *unconditionally* so a rebind against a different adapter build cannot inherit the previous one's list |
+| Refusal type | `agent/claude_acp_session.py` | `ClaudeAcpModelSelectionError` — no live session, no advertised models, unadvertised model, turn in flight, or the adapter's own refusal (reason preserved) |
+| Runtime accessors | `agent/claude_code_runtime.py` | `ClaudeAcpModelOption`, `claude_acp_session()`, `claude_acp_model_options()` (both with `require_connected`, so an idle-evicted session's remembered list is reachable without claiming it is selectable), `claude_acp_select_model()`; `_record_model_identity()` is now the single writer of the attribute slice A's display accessors read, shared by turn capture and by a pick |
+| Shared `/model` seam | `hermes_cli/claude_acp_model_select.py` | `handle_claude_acp_model_command()` — the one owner of the listing, the name resolution (exact id / label / adapter name / unambiguous prefix), the flag policy and every line of copy. Mirrors `hermes_cli/codex_runtime_switch.py`'s one-module-per-shared-command precedent |
+| CLI wiring | `cli.py` (`_handle_model_switch`) | Calls the seam right after arg parsing and the `--refresh` cache bust — the same order the gateway uses, so `--refresh` (a fact about Hermes' own on-disk provider catalog, not about this session's list) means the same thing on both surfaces whether or not the seam then answers; renders `text` with the CLI's `✓`/`✗` |
+| Gateway wiring | `gateway/slash_commands.py` (`_handle_model_command`) | Same call after the session key is resolved, via `asyncio.to_thread` (the pick is a blocking JSON-RPC round trip and must not run on the event loop), rendering failures through the existing `gateway.model.error_prefix` copy |
+| Resident-agent lookup | `gateway/slash_commands.py` | `_resident_agent_for_session()` — `_running_agents` then `_agent_cache`, the same two places `/usage` looks; never creates an agent |
+
+**Acceptance checks.**
+1. The offered list is exactly what the live session advertised, in its order,
+   with concise labels, the adapter's display names, and exactly one entry
+   marked current.
+2. A session that advertises no models (older adapter, empty allowlist) offers
+   nothing and leaves `/model` untouched — while slice A's identity display
+   keeps working. This holds *per connection*: a rebind whose response carries
+   no model entry, or one advertising nothing, drops what the previous adapter
+   said rather than inheriting it, so `/model` never offers or validates
+   against a list the live session did not give.
+3. A pick goes out as `session/set_config_option` with `configId: "model"` on
+   the live ACP session id, and the adapter records exactly one such call.
+4. After a pick: same adapter pid, same ACP session id, still connected, and
+   the next turn recalls the previous one (no reseed) — Packet 2's reuse and
+   Claude Code's own prompt cache intact.
+5. `claude_acp_display_model()` and `claude_acp_model_identity()` reflect the
+   pick immediately, with no further turn, and the next turn's usage row is
+   priced under the new authoritative id.
+6. `agent.model` is unchanged by a pick, no session model override is written,
+   no cached agent is evicted, and nothing is persisted to `config.yaml`.
+7. Every refusal — no session, an idle-evicted adapter, an unadvertised name, an
+   adapter rejection, a turn in flight, **and a session that changed while the
+   adapter was answering** — leaves the running model and the displayed identity
+   as they were, and an unadvertised name never reaches the wire.
+8. `--global` / `--once` are refused by name without switching; `--provider`,
+   another provider's model, a non-Claude-Code agent and a seam fault all fall
+   through to the unchanged cross-provider path.
+9. On the gateway the pick runs off the event loop, and the resident agent is
+   found whether it is mid-turn (`_running_agents`) or between turns
+   (`_agent_cache`).
+10. Existing Packet 0–4A suites plus every `/model` suite on both surfaces stay
+    green. As run: 368 tests across the Claude Code ACP files (this slice's own
+    included), 30 across the gateway `/model` files, 591 across the
+    CLI/TUI-gateway and `hermes_cli` `/model` files, and `tests/cli/` (957),
+    `tests/gateway/`, `tests/hermes_cli/`, `tests/agent/transports/` and
+    `tests/acp/` in full. The one failure anywhere in that sweep —
+    `tests/hermes_cli/test_doctor.py::test_doctor_reports_vercel_backend_diagnostics`
+    — reproduces unchanged on a clean `HEAD` worktree and is unrelated
+    (Vercel-sandbox doctor diagnostics).
+
+**Safety invariants.** `agent.model` is still never mutated by this runtime,
+for exactly slice A's reason. Prompt caching, role alternation, session
+continuity, the negotiated permission mode and workspace roots, credential
+redaction and authorization are all untouched: a pick sends one control RPC on
+an already-negotiated session and re-runs none of the negotiation. Approval
+isolation is unchanged — this path never touches `tools/approval.py`, and the
+gateway's existing mid-turn `/model` refusal ("wait or /stop") still applies
+before the seam is ever reached, with `set_model`'s own `turn_in_flight` guard
+as the in-process backstop for surfaces that allow it. That backstop is now
+re-established *after* the RPC as well as before it: the round trip runs
+unlocked (holding `_lock` across it would block `request_cancel`, i.e. swallow
+the user's `/stop`), so the pre-RPC guards are check-then-act and only the
+commit can be made safe — a reply that comes back to a retired adapter, a
+different ACP session, or a turn that started meanwhile is discarded and
+refused. Unreachable from today's surfaces, and fixed anyway: `turn_in_flight`
+is a guarantee the next surface to wire `/model` will trust. Every other provider is
+byte-for-byte unaffected: the seam returns `None` unless the agent's `api_mode`
+is `claude_code_acp` *and* a live session advertises models.
+
+**Stop condition.** Met — no blocker. `session/set_config_option` is a stable,
+implemented verb on the pinned adapter, and the advertised option list gave the
+gating and allowlist answers the earlier `session/set_model` sketch could not.
 
 ---
 
