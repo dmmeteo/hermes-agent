@@ -149,6 +149,137 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
     return hint + _TUI_EMBEDDED_PANE_CLARIFIER
 
 
+def prompt_context_length(agent: Any) -> Optional[int]:
+    """The model's context window, or ``None`` for the historical flat default.
+
+    Extracted verbatim from :func:`build_system_prompt_parts` so a second
+    consumer (``agent/claude_acp_system_prompt.py``) can scale the same caps to
+    the same window without re-deriving the rule. Stable for the life of the
+    conversation, so it does not threaten prompt caching.
+    """
+    _cc = getattr(agent, "context_compressor", None)
+    if _cc is not None:
+        _cc_len = getattr(_cc, "context_length", None)
+        if isinstance(_cc_len, int) and _cc_len > 0:
+            return _cc_len
+    return None
+
+
+def build_identity_block(
+    agent: Any, context_length: Optional[int] = None
+) -> tuple[str, bool]:
+    """The agent's identity block, and whether it came from SOUL.md.
+
+    Returns ``(text, soul_loaded)``. SOUL.md is the primary identity unless the
+    caller explicitly skipped it — some execution modes (cron) still want the
+    ``HERMES_HOME`` persona while keeping cwd project instructions disabled —
+    and ``DEFAULT_AGENT_IDENTITY`` is the fallback.
+
+    ``soul_loaded`` is what feeds ``build_context_files_prompt(skip_soul=...)``
+    so SOUL.md is never injected twice.
+
+    Extracted from :func:`build_system_prompt_parts` unchanged: the Claude Code
+    ACP composer needs exactly this decision, and a second copy of it would
+    drift (AGENTS.md §"Extend, don't duplicate").
+    """
+    if agent.load_soul_identity or not agent.skip_context_files:
+        _soul_content = _ra().load_soul_md(context_length)
+        if _soul_content:
+            return _soul_content, True
+    return DEFAULT_AGENT_IDENTITY, False
+
+
+def build_active_profile_hint() -> str:
+    """Name the Hermes profile this session runs under.
+
+    Keeps the agent from conflating ``~/.hermes/skills/`` (default profile)
+    with ``~/.hermes/profiles/<active>/skills/`` (this profile's). Deterministic
+    for the lifetime of the agent — the profile name does not change
+    mid-session, so this does not break the prompt cache.
+
+    See ``file_safety._resolve_active_profile_name`` +
+    ``classify_cross_profile_target`` for the matching tool-side guard.
+    """
+    try:
+        from agent.file_safety import _resolve_active_profile_name
+        active_profile = _resolve_active_profile_name()
+    except Exception:
+        active_profile = "default"
+    if active_profile == "default":
+        return (
+            "Active Hermes profile: default. Other profiles (if any) live "
+            "under " + str(get_hermes_home()) + "/profiles/<name>/. Each profile has its own "
+            "skills/, plugins/, cron/, and memories/ that affect a different "
+            "session than this one. Do not modify another profile's "
+            "skills/plugins/cron/memories unless the user explicitly directs "
+            "you to."
+        )
+    return (
+        f"Active Hermes profile: {active_profile}. This session reads "
+        f"and writes {get_hermes_home()}/profiles/{active_profile}/. The default "
+        f"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, "
+        f"{get_hermes_home()}/cron/, {get_hermes_home()}/memories/ — those belong to a "
+        f"different session run from a different shell. Do NOT modify "
+        f"another profile's skills/plugins/cron/memories unless the user "
+        f"explicitly directs you to. The cross-profile write guard will "
+        f"refuse such writes by default; pass cross_profile=True only "
+        f"after explicit direction."
+    )
+
+
+def resolve_platform_hint_block(agent: Any) -> str:
+    """The effective platform hint for this agent, or ``""``.
+
+    Resolution order, extracted verbatim from
+    :func:`build_system_prompt_parts`: the built-in ``PLATFORM_HINTS`` entry,
+    else a plugin's registered hint; the Telegram rich-messages extension when
+    the profile opted in; then the ``platform_hints`` config override
+    (:func:`_resolve_platform_hint`); then the TUI embedded-pane clarifier.
+    """
+    platform_key = (agent.platform or "").lower().strip()
+    # Resolve the built-in/plugin default hint for this platform, then apply
+    # any per-platform override from config (platform_hints.<platform>).
+    _default_hint = ""
+    if platform_key in PLATFORM_HINTS:
+        _default_hint = PLATFORM_HINTS[platform_key]
+    elif platform_key:
+        # Check plugin registry for platform-specific LLM guidance
+        try:
+            from gateway.platform_registry import platform_registry
+            _entry = platform_registry.get(platform_key)
+            if _entry and _entry.platform_hint:
+                _default_hint = _entry.platform_hint
+        except Exception:
+            pass
+
+    # For Telegram: append the rich-messages extension only when the user has
+    # opted in to ``gateway.platforms.telegram.extra.rich_messages: true``
+    # (the canonical location the adapter reads from).  Merge with the
+    # top-level ``platforms.telegram.extra`` so config-wizard writes and
+    # dashboard-setup keys are also visible — same precedence the adapter
+    # uses: top-level platform overrides gateway.platforms at the leaf.
+    if platform_key == "telegram" and _default_hint:
+        try:
+            from hermes_cli.config import load_config_readonly
+            _cfg = load_config_readonly()
+            _gw_tg_extra = (((_cfg.get("gateway") or {}).get("platforms") or {}).get("telegram") or {}).get("extra")
+            _top_tg_extra = ((_cfg.get("platforms") or {}).get("telegram") or {}).get("extra")
+            if not isinstance(_gw_tg_extra, dict):
+                _gw_tg_extra = {}
+            if not isinstance(_top_tg_extra, dict):
+                _top_tg_extra = {}
+            _tg_extra = {**_gw_tg_extra, **_top_tg_extra}
+            if _tg_extra.get("rich_messages"):
+                _default_hint = _default_hint.rstrip() + " " + TELEGRAM_RICH_MESSAGES_HINT
+        except Exception:
+            pass  # Config read failure — fall back to base hint only
+
+    _effective_hint = _resolve_platform_hint(agent, platform_key, _default_hint)
+    if platform_key == "tui" and _effective_hint:
+        _effective_hint = _tui_embedded_pane_clarifier(_effective_hint)
+    return _effective_hint
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
@@ -176,12 +307,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # to it (dynamic cap — see prompt_builder._dynamic_context_file_max_chars).
     # None falls back to the historical flat default. This value is stable for
     # the life of the conversation, so it does not threaten prompt caching.
-    _ctx_len: Optional[int] = None
-    _cc = getattr(agent, "context_compressor", None)
-    if _cc is not None:
-        _cc_len = getattr(_cc, "context_length", None)
-        if isinstance(_cc_len, int) and _cc_len > 0:
-            _ctx_len = _cc_len
+    _ctx_len: Optional[int] = prompt_context_length(agent)
 
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
@@ -189,16 +315,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Try SOUL.md as primary identity unless the caller explicitly skipped it.
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
-    _soul_loaded = False
-    if agent.load_soul_identity or not agent.skip_context_files:
-        _soul_content = _r.load_soul_md(_ctx_len)
-        if _soul_content:
-            stable_parts.append(_soul_content)
-            _soul_loaded = True
-
-    if not _soul_loaded:
-        # Fallback to hardcoded identity
-        stable_parts.append(DEFAULT_AGENT_IDENTITY)
+    _identity, _soul_loaded = build_identity_block(agent, _ctx_len)
+    stable_parts.append(_identity)
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
@@ -401,74 +519,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # mid-session, so this doesn't break the prompt cache.
     # See file_safety._resolve_active_profile_name + classify_cross_profile_target
     # for the matching tool-side guard.
-    try:
-        from agent.file_safety import _resolve_active_profile_name
-        active_profile = _resolve_active_profile_name()
-    except Exception:
-        active_profile = "default"
-    if active_profile == "default":
-        post_workspace_parts.append(
-            "Active Hermes profile: default. Other profiles (if any) live "
-            "under " + str(get_hermes_home()) + "/profiles/<name>/. Each profile has its own "
-            "skills/, plugins/, cron/, and memories/ that affect a different "
-            "session than this one. Do not modify another profile's "
-            "skills/plugins/cron/memories unless the user explicitly directs "
-            "you to."
-        )
-    else:
-        post_workspace_parts.append(
-            f"Active Hermes profile: {active_profile}. This session reads "
-            f"and writes {get_hermes_home()}/profiles/{active_profile}/. The default "
-            f"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, "
-            f"{get_hermes_home()}/cron/, {get_hermes_home()}/memories/ — those belong to a "
-            f"different session run from a different shell. Do NOT modify "
-            f"another profile's skills/plugins/cron/memories unless the user "
-            f"explicitly directs you to. The cross-profile write guard will "
-            f"refuse such writes by default; pass cross_profile=True only "
-            f"after explicit direction."
-        )
+    post_workspace_parts.append(build_active_profile_hint())
 
-    platform_key = (agent.platform or "").lower().strip()
-    # Resolve the built-in/plugin default hint for this platform, then apply
-    # any per-platform override from config (platform_hints.<platform>).
-    _default_hint = ""
-    if platform_key in PLATFORM_HINTS:
-        _default_hint = PLATFORM_HINTS[platform_key]
-    elif platform_key:
-        # Check plugin registry for platform-specific LLM guidance
-        try:
-            from gateway.platform_registry import platform_registry
-            _entry = platform_registry.get(platform_key)
-            if _entry and _entry.platform_hint:
-                _default_hint = _entry.platform_hint
-        except Exception:
-            pass
-
-    # For Telegram: append the rich-messages extension only when the user has
-    # opted in to ``gateway.platforms.telegram.extra.rich_messages: true``
-    # (the canonical location the adapter reads from).  Merge with the
-    # top-level ``platforms.telegram.extra`` so config-wizard writes and
-    # dashboard-setup keys are also visible — same precedence the adapter
-    # uses: top-level platform overrides gateway.platforms at the leaf.
-    if platform_key == "telegram" and _default_hint:
-        try:
-            from hermes_cli.config import load_config_readonly
-            _cfg = load_config_readonly()
-            _gw_tg_extra = (((_cfg.get("gateway") or {}).get("platforms") or {}).get("telegram") or {}).get("extra")
-            _top_tg_extra = ((_cfg.get("platforms") or {}).get("telegram") or {}).get("extra")
-            if not isinstance(_gw_tg_extra, dict):
-                _gw_tg_extra = {}
-            if not isinstance(_top_tg_extra, dict):
-                _top_tg_extra = {}
-            _tg_extra = {**_gw_tg_extra, **_top_tg_extra}
-            if _tg_extra.get("rich_messages"):
-                _default_hint = _default_hint.rstrip() + " " + TELEGRAM_RICH_MESSAGES_HINT
-        except Exception:
-            pass  # Config read failure — fall back to base hint only
-
-    _effective_hint = _resolve_platform_hint(agent, platform_key, _default_hint)
-    if platform_key == "tui" and _effective_hint:
-        _effective_hint = _tui_embedded_pane_clarifier(_effective_hint)
+    _effective_hint = resolve_platform_hint_block(agent)
     if _effective_hint:
         post_workspace_parts.append(_effective_hint)
 
@@ -686,6 +739,10 @@ def format_tools_for_system_message(agent: Any) -> str:
 
 
 __all__ = [
+    "build_active_profile_hint",
+    "build_identity_block",
+    "prompt_context_length",
+    "resolve_platform_hint_block",
     "build_system_prompt_parts",
     "build_system_prompt",
     "invalidate_system_prompt",

@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from agent.claude_acp_binding import BindingStore, TurnLeaseConflict
+from agent.claude_acp_system_prompt import compose_for_agent
 from agent.claude_acp_session import (
     ClaudeAcpModelSelectionError,
     ClaudeAcpSession,
@@ -73,6 +74,8 @@ __all__ = [
     "claude_acp_model_options",
     "claude_acp_select_model",
     "claude_acp_session",
+    "claude_acp_system_prompt_digest",
+    "claude_acp_system_prompt_text",
     "claude_acp_usage_model",
     "make_claude_acp_event_bridge",
     "make_claude_acp_permission_bridge",
@@ -406,6 +409,39 @@ def claude_acp_session(
     if require_connected and not session.is_connected():
         return None
     return session
+
+
+def claude_acp_system_prompt_text(agent: Any) -> Optional[str]:
+    """The Hermes operating context *agent*'s session was created with.
+
+    Introspection only — nothing in the turn path reads it, and nothing
+    displays it. It exists so tests can assert against the exact bytes that
+    went on the wire without reaching into private state, and so a future
+    status surface has one place to ask. ``None`` before the first connect,
+    when the profile turned the feature off, and when composition failed.
+
+    Deliberately reads the session that is still *bound* rather than requiring
+    a live adapter: what a conversation was created with does not stop being
+    true when its adapter is idle-evicted.
+    """
+    session = getattr(agent, "_claude_acp_session", None)
+    composed = getattr(session, "_system_prompt", None)
+    text = getattr(composed, "text", None)
+    return text if isinstance(text, str) and text else None
+
+
+def claude_acp_system_prompt_digest(agent: Any) -> Optional[str]:
+    """The sha256 of what was **sent**, or ``None``.
+
+    Says *sent*, never *applied*: adapter 0.66.0 advertises no capability for
+    "I honoured ``_meta.systemPrompt``", and ``model.claude_code_acp.command``
+    can point at any ACP agent. This is what Hermes put on the wire, which is
+    the only claim it can make honestly — and it is the value that appears in
+    logs and in the binding, in place of the text.
+    """
+    session = getattr(agent, "_claude_acp_session", None)
+    digest = getattr(session, "sent_system_prompt_digest", None)
+    return digest if isinstance(digest, str) and digest else None
 
 
 def _known_model_options(agent: Any) -> List[Dict[str, str]]:
@@ -1073,6 +1109,11 @@ def _get_or_create_session(
         cwd=cwd,
         additional_directories=additional_directories,
         permission_mode=permission_mode,
+        # Packet 6. Deliberately NOT an argument to `matches()` above: a changed
+        # SOUL.md or system_prompt key takes effect at the next connect, not by
+        # retiring the adapter a live conversation is running on (D3). The
+        # session calls this at most once and memoizes the result.
+        system_prompt_provider=lambda: compose_for_agent(agent),
         store=BindingStore.for_agent(agent),
         # A persistence-isolated fork shares the parent's session_id, so
         # keying the registry on it would retire the user's live adapter out

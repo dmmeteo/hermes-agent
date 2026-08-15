@@ -208,6 +208,7 @@ class ClaudeAcpSession:
         hermes_session_id: str = "",
         additional_directories: Optional[List[str]] = None,
         permission_mode: str = DEFAULT_PERMISSION_MODE,
+        system_prompt_provider: Optional[Callable[[], Any]] = None,
     ) -> None:
         self.argv = list(argv)
         self.cwd = cwd
@@ -274,6 +275,20 @@ class ClaudeAcpSession:
         #: kept purely for introspection (`hermes doctor`, tests, a future
         #: status surface); nothing in the turn path reads it.
         self.last_skill_bridge_result: Optional[Any] = None
+        #: Packet 6. Composes the Hermes operating context this session is
+        #: created with. Called at most ONCE for the life of this object and
+        #: memoized into :attr:`_system_prompt`: an idle-eviction respawn 30
+        #: minutes later must send the same bytes to the same conversation, not
+        #: whatever SOUL.md happens to say by then. ``None`` means the runtime
+        #: wired no provider (a direct construction, a test).
+        self._system_prompt_provider = system_prompt_provider
+        self._system_prompt: Optional[Any] = None
+        self._system_prompt_composed = False
+        #: The digest of what the last connect actually put on the wire, or
+        #: ``None``. Says *sent* — there is no capability for "the agent
+        #: honoured it", and the field name is the place that has to stay
+        #: honest about the difference.
+        self.sent_system_prompt_digest: Optional[str] = None
         _register(self)
 
     # ---------- introspection ----------
@@ -547,6 +562,15 @@ class ClaudeAcpSession:
         until the adapter happens to be replaced. Rebuilding is what makes the
         config the source of truth; the posture is exactly the setting where
         "eventually" is the wrong answer.
+
+        The Hermes operating context (Packet 6) is deliberately **not** part of
+        this answer, and that is a decision rather than an omission. The
+        permission mode is a security property worth retiring a healthy adapter
+        for; an identity blob is not, and a rebuild costs the Claude-side
+        session and its prompt cache. A changed ``SOUL.md`` or a changed
+        ``system_prompt`` key therefore takes effect at the **next connect** —
+        the same rule the skills bridge states — rather than by killing the
+        adapter a live conversation is running on.
         """
         return (
             self.argv == list(argv)
@@ -706,10 +730,23 @@ class ClaudeAcpSession:
         # advertised the field gets the cwd alone, which is narrower.
         roots = self._negotiable_roots(client)
 
+        # Packet 6: the Hermes operating context rides in the session-creation
+        # call and ONLY there — `session/prompt` still carries the user's turn
+        # alone, so nothing is replayed per turn. Composed at most once for this
+        # object (memoized) and re-sent byte-identically on a rebind, because
+        # `session/load` makes the adapter create a fresh query from the params'
+        # `_meta`. Fail-open: `None` means this session is created exactly the
+        # way it was before this packet.
+        composed = self._compose_system_prompt()
+        prompt_meta = composed.meta() if composed is not None else None
+
         reseeded = bool(prior) and not bound
         if bound and client.supports_load_session:
             try:
-                client.session_load(bound, additional_directories=roots)
+                client.session_load(
+                    bound, additional_directories=roots,
+                    system_prompt=prompt_meta,
+                )
                 # The agent replays its history as notifications before
                 # answering. Hermes owns the transcript, so none of it may be
                 # projected — and none of it may still be queued when the next
@@ -735,7 +772,9 @@ class ClaudeAcpSession:
             reseeded = True
 
         if not self._acp_session_id:
-            self._acp_session_id = client.session_new(additional_directories=roots)
+            self._acp_session_id = client.session_new(
+                additional_directories=roots, system_prompt=prompt_meta,
+            )
 
         # Packet 4: whichever of session/new or session/load just ran populated
         # the client's configOptions capture — both the authoritative model id
@@ -747,9 +786,80 @@ class ClaudeAcpSession:
         # advertises rather than against a list a previous adapter gave.
         self._capture_mode_state(client)
         self._negotiate_permission_mode(client)
-        self._store.bind(self._acp_session_id, self.cwd)
+        self._record_system_prompt(composed, binding)
         turn.session_id = self._acp_session_id
         return reseeded
+
+    def _compose_system_prompt(self) -> Optional[Any]:
+        """The Hermes operating context for this session, composed at most once.
+
+        Memoized including the ``None`` answer: whether the profile turned this
+        off, whether the composition failed, and what it produced are all facts
+        about the conversation this object serves, and re-deriving them per
+        connect would let an idle respawn send different bytes to the same ACP
+        session for no reason a user could observe or explain.
+
+        Fail-open (D7): a provider that raises costs one WARNING and a session
+        created exactly as it is created with the feature off. An identity blob
+        must never cost a user their message.
+        """
+        if self._system_prompt_composed:
+            return self._system_prompt
+        self._system_prompt_composed = True
+        provider = self._system_prompt_provider
+        if provider is None:
+            return None
+        try:
+            composed = provider()
+        except Exception:
+            logger.warning(
+                "Claude Code ACP: composing the Hermes operating context failed "
+                "for session %s; continuing without one", self.key, exc_info=True,
+            )
+            composed = None
+        if composed is not None and not callable(getattr(composed, "meta", None)):
+            # A provider that answered with something this class cannot put on
+            # the wire. Fail-open here rather than at `composed.meta()` three
+            # lines into `_connect`, where it would abort the turn — the whole
+            # point of D7 is that an identity blob never costs a message.
+            logger.warning(
+                "Claude Code ACP: the system-prompt provider for session %s "
+                "returned an unusable value; continuing without one", self.key,
+            )
+            composed = None
+        self._system_prompt = composed
+        return self._system_prompt
+
+    def _record_system_prompt(
+        self, composed: Optional[Any], binding: Dict[str, Any]
+    ) -> None:
+        """Persist the digest of what was sent, and say so once. Never the text.
+
+        A cross-process rebind normally recomposes byte-identically (the Hermes
+        system prompt is restored from ``sessions.system_prompt`` rather than
+        rebuilt), so the stored digest matches and this is silent. When it
+        differs — an edited ``SOUL.md``, a memory write that outlived a rebuild
+        — Hermes sends the new text, says so with both digests, and updates the
+        binding. It deliberately does NOT reseed: a changed identity blob is not
+        a lost conversation, and Claude Code rebuilds its own system prompt on
+        every resume regardless.
+        """
+        digest = getattr(composed, "digest", "") if composed is not None else ""
+        mode = getattr(composed, "mode", "") if composed is not None else ""
+        previous = str(binding.get("system_prompt_sha256") or "")
+        self.sent_system_prompt_digest = digest or None
+        self._store.bind(self._acp_session_id or "", self.cwd, digest, mode)
+        if composed is None:
+            return
+        if previous and previous != digest:
+            logger.info(
+                "Claude Code ACP: the Hermes operating context changed since "
+                "this session was last bound (was sha256=%s…, now sha256=%s…); "
+                "sending the new one", previous[:12], digest[:12],
+            )
+        from agent.claude_acp_system_prompt import describe_composition
+
+        logger.info(describe_composition(composed))
 
     def _capture_mode_state(self, client: Any) -> None:
         """Re-seed the live permission-mode state from a connected *client*.

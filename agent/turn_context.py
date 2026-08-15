@@ -716,6 +716,17 @@ def build_turn_context(
     if agent._cached_system_prompt is None:
         restore_or_build_system_prompt(agent, system_message, conversation_history)
 
+    # The caller's own instructions, kept beside the prompt they were built
+    # into. Delegated runs and cron jobs pass a ``system_message``; on every
+    # provider but one it lands in the built prompt and that is the end of it.
+    # The Claude Code ACP runtime never sends that prompt (it sends a curated
+    # context composed at session creation — agent/claude_acp_system_prompt.py),
+    # so without this the instruction would be silently dropped on that provider
+    # alone. Read only there, and only at the first connect, so it inherits the
+    # cached prompt's own "built once, first turn wins" semantics. Zero
+    # behavioural change for every other provider.
+    agent._active_system_message = system_message
+
     active_system_prompt = agent._cached_system_prompt
 
     # Create the DB session row now that _cached_system_prompt is populated, so

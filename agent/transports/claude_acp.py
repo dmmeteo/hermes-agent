@@ -618,12 +618,24 @@ class ClaudeAcpClient:
         mcp_servers: Optional[list] = None,
         timeout: float = 60.0,
         additional_directories: Optional[list[str]] = None,
+        system_prompt: Optional[dict] = None,
     ) -> str:
         """Create a session scoped to ``cwd`` plus any ``additional_directories``.
 
         The extra roots are the caller's containment decision and are sent only
         when they asked for some; capability-gating them is
         :attr:`supports_additional_directories`' job, one level up.
+
+        ``system_prompt`` is the adapter's own documented extension point,
+        ``_meta.systemPrompt``. It needs no capability negotiation — ``_meta``
+        is a first-class ACP field — and an agent that does not know it ignores
+        it. It must be the **object** form
+        (``{"type": "preset", "preset": "claude_code", "append": ...}``): the
+        adapter clamps ``type``/``preset`` back to its own preset there, so the
+        text can only add. A bare string in this field *replaces* the preset,
+        deleting Claude Code's own tool instructions for the session, which is
+        why ``agent/claude_acp_system_prompt.py`` is the only thing that builds
+        it (:func:`~agent.claude_acp_system_prompt.system_prompt_meta`).
         """
         params: dict[str, Any] = {
             "cwd": cwd or self._cwd,
@@ -631,6 +643,12 @@ class ClaudeAcpClient:
         }
         if additional_directories:
             params["additionalDirectories"] = list(additional_directories)
+        if system_prompt is not None:
+            # Merged rather than assigned: `_meta` is a shared envelope, and a
+            # future second consumer of it must not be silently overwritten.
+            meta = dict(params.get("_meta") or {})
+            meta["systemPrompt"] = system_prompt
+            params["_meta"] = meta
         result = self.request("session/new", params, timeout=timeout)
         session_id = result.get("sessionId")
         if not session_id:
@@ -732,6 +750,7 @@ class ClaudeAcpClient:
         on_update: Optional[Callable[[dict], None]] = None,
         timeout: float = 120.0,
         additional_directories: Optional[list[str]] = None,
+        system_prompt: Optional[dict] = None,
     ) -> dict:
         """Rebind an existing agent session.
 
@@ -743,6 +762,12 @@ class ClaudeAcpClient:
         re-negotiated on a rebind: they are session state the agent re-derives
         for the reattached session, so a load that omitted them would silently
         run the rest of the conversation at a different scope.
+
+        ``system_prompt`` is re-sent for exactly that reason too: the pinned
+        adapter answers ``session/load`` by *creating* a query with the params'
+        ``_meta``, so a load that omitted it would run the rest of the
+        conversation with no Hermes context. See :meth:`session_new` for why it
+        must be the object form.
         """
         params: dict[str, Any] = {
             "sessionId": session_id,
@@ -751,6 +776,10 @@ class ClaudeAcpClient:
         }
         if additional_directories:
             params["additionalDirectories"] = list(additional_directories)
+        if system_prompt is not None:
+            meta = dict(params.get("_meta") or {})
+            meta["systemPrompt"] = system_prompt
+            params["_meta"] = meta
         result = self._request_pumping(
             "session/load",
             params,

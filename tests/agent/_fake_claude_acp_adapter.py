@@ -164,10 +164,19 @@ mode they report as current before the client negotiates anything
 ``auto``), a switch that omits the ``modes`` key entirely — the older-adapter
 case a client must not read as "inherit whatever is there" — and a switch that
 makes every ``session/set_mode`` fail.
+
+``FAKE_ACP_ECHO_SYSTEM_PROMPT`` (Packet 6): when set, every reply this adapter
+produces is prefixed with ``sysprompt[<sha8>:<chars>] `` describing the
+``_meta.systemPrompt.append`` it received on ``session/new`` / ``session/load``
+(``sysprompt[none] `` when it received none). This is what turns "Hermes wrote
+the field into a params dict" into "the agent side actually received it": an
+assertion against ``session_new_params`` only proves the former, and the former
+is not the claim the feature makes.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -259,6 +268,12 @@ _SWITCH_MODE = os.getenv("FAKE_ACP_SWITCH_MODE", "plan")
 _RECORD_PATH = os.getenv("FAKE_ACP_RECORD", "")
 _RECORD_DIR = os.getenv("FAKE_ACP_RECORD_DIR", "")
 _STORE_DIR = os.getenv("FAKE_ACP_STORE", "")
+#: Packet 6: echo a digest of the `_meta.systemPrompt.append` this session was
+#: created with, so a test can assert on RECEIPT rather than on a params dict
+#: Hermes itself wrote.
+_ECHO_SYSTEM_PROMPT = os.getenv("FAKE_ACP_ECHO_SYSTEM_PROMPT", "") == "1"
+#: acp session id -> the append it was created/reloaded with ("" for none).
+_received_system_prompts: dict = {}
 _cancelled = threading.Event()
 _session_counter = 0
 
@@ -386,6 +401,28 @@ def _send(obj: dict) -> None:
 def _update(session_id: str, update: dict) -> None:
     _send({"jsonrpc": "2.0", "method": "session/update",
            "params": {"sessionId": session_id, "update": update}})
+
+
+def _system_prompt_echo(session_id: str) -> str:
+    """``sysprompt[<sha8>:<chars>] `` for the append this session was created
+    with, or ``""`` when the echo is off."""
+    if not _ECHO_SYSTEM_PROMPT:
+        return ""
+    with _record_lock:
+        append = _received_system_prompts.get(session_id)
+    if not append:
+        return "sysprompt[none] "
+    digest = hashlib.sha256(append.encode("utf-8")).hexdigest()
+    return f"sysprompt[{digest[:8]}:{len(append)}] "
+
+
+def _capture_system_prompt(session_id: str, params: dict) -> None:
+    """Remember the ``append`` this session was created (or reloaded) with."""
+    meta = params.get("_meta")
+    prompt = (meta or {}).get("systemPrompt") if isinstance(meta, dict) else None
+    append = prompt.get("append") if isinstance(prompt, dict) else None
+    with _record_lock:
+        _received_system_prompts[session_id] = append if isinstance(append, str) else ""
 
 
 def _text(session_id: str, text: str) -> None:
@@ -854,6 +891,7 @@ def _handle_load(msg: dict) -> None:
         _record["session_load_calls"].append(session_id)
         _record["session_load_params"].append(params)
     _flush_record()
+    _capture_system_prompt(session_id, params)
 
     if _MODE == "load-fails":
         _send({"jsonrpc": "2.0", "id": msg["id"], "error": {
@@ -917,7 +955,11 @@ def _handle_prompt(msg: dict) -> None:
         # session recalls turns an earlier adapter served.
         stored = _store_read(session_id)
         prior = stored.get("prompts") or []
-        _text(session_id, "recall[" + " | ".join(prior) + "]")
+        _text(
+            session_id,
+            _system_prompt_echo(session_id)
+            + "recall[" + " | ".join(prior) + "]",
+        )
         prior.append(_prompt_text(params))
         _store_write(session_id, {"prompts": prior})
         _send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}})
@@ -1169,8 +1211,10 @@ def main() -> None:
                 continue
             with _record_lock:
                 _record["session_new_params"].append(msg.get("params") or {})
+            _new_id = _new_session_id()
+            _capture_system_prompt(_new_id, msg.get("params") or {})
             new_result: dict = {
-                "sessionId": _new_session_id(),
+                "sessionId": _new_id,
                 "configOptions": _model_config_options(),
             }
             if not _NO_MODES:

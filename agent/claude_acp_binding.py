@@ -143,7 +143,25 @@ class BindingStore:
 
     # ---------- binding ----------
 
-    def bind(self, acp_session_id: str, cwd: str) -> None:
+    def bind(
+        self,
+        acp_session_id: str,
+        cwd: str,
+        system_prompt_sha256: str = "",
+        system_prompt_mode: str = "",
+    ) -> None:
+        """Record the binding, plus a *digest* of the context this session got.
+
+        The digest, never the text (Packet 6, D5): the text is already stored
+        once per session in ``sessions.system_prompt``, and a second copy in a
+        JSON column on a database users have grown to hundreds of megabytes
+        buys nothing. What the truthfulness story actually needs is the ability
+        to say "this session was created with these bytes" and to notice on a
+        cross-process rebind that it no longer is — and a digest answers both.
+
+        Two extra keys in an existing JSON blob: no new column, no new table,
+        no ``_config_version`` bump, and both optional on read.
+        """
         binding = self.read()
         binding.update(
             {
@@ -152,6 +170,15 @@ class BindingStore:
                 "updated_at": time.time(),
             }
         )
+        # Absent rather than empty when nothing was sent (``mode: off``), so a
+        # binding written before this packet and one written with the feature
+        # off read the same way.
+        if system_prompt_sha256:
+            binding["system_prompt_sha256"] = system_prompt_sha256
+            binding["system_prompt_mode"] = system_prompt_mode
+        else:
+            binding.pop("system_prompt_sha256", None)
+            binding.pop("system_prompt_mode", None)
         self._write(binding)
 
     def clear(self) -> None:

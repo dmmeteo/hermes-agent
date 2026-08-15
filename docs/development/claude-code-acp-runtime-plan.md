@@ -101,6 +101,7 @@ precedent for this shape.
 | Workspace roots | new `agent/claude_acp_workspace.py` | **Exists (Packet 3C)** — resolves `cwd` + explicitly-allowed `additionalDirectories` from `model.claude_code_acp.additional_directories`, and owns the root check every agent-initiated path is measured against |
 | Session binding + turn lease | new `agent/claude_acp_binding.py` | ACP session id + lease on the Hermes `sessions.model_config` row (**exists, Packet 2**) |
 | Permission posture | new `agent/claude_acp_permissions.py` | **Exists (Packet 5A)** — turns `model.claude_code_acp.permission_mode` into the mode negotiated against what the live session advertises, or into sending nothing at all (`inherit`) |
+| Hermes operating context | new `agent/claude_acp_system_prompt.py` | **Exists (Packet 6)** — turns `model.claude_code_acp.system_prompt` into the curated identity/environment/profile/platform/memory context sent once per ACP session as `_meta.systemPrompt` (object form, `claude_code` preset preserved). Default `hermes`; excludes every Hermes-only tool-guidance block, the skills index and the context files by default |
 | Skill bridge | new `agent/claude_acp_skills.py` | **Exists (Packet 5C)** — plans and materializes a bounded, manifest-owned link farm in the **adapter child's** `<config dir>/skills`, from `model.claude_code_acp.skills`. Off by default; the link dir is derived from the same `hermes_subprocess_env` the client spawns with, never `Path.home()` |
 | Event projection | new `agent/transports/claude_acp_event_projector.py` | Analogue of `codex_event_projector.py` (**exists, Packet 3A**), consumed through the `event_sink` seam on `ClaudeAcpSession.run_turn` and the bridge in `claude_code_runtime.make_claude_acp_event_bridge` |
 | Wire client | `agent/transports/claude_acp.py` | **Exists (Packet 0)** |
@@ -1245,6 +1246,174 @@ developer's real `~/.claude/skills`, next to the 8 stale ones.
 **Open question carried forward.** `prune_unmanaged` has no known legitimate use:
 it exists so the option is explicit rather than implied by the manifest design.
 If a release goes by without anyone setting it, delete the key.
+
+---
+
+## Packet 6 — the Hermes operating context inside the session ✅ COMPLETE
+
+**The gap.** A Claude Code ACP turn ran with **zero** Hermes-authored context —
+not a reduced version, none. `agent/turn_context.py:716` builds (or restores)
+`agent._cached_system_prompt` for every turn *including* this runtime's, and
+`agent/conversation_loop.py:1638` then hands the turn to
+`agent/claude_code_runtime.py`, which put exactly one thing on the wire: the
+user's message. So Hermes paid the file I/O for SOUL.md / memory / USER.md every
+session, persisted the result to `sessions.system_prompt`, and threw it away for
+this provider. The model answering did not know it was Hermes, did not know who
+the user is, did not know it was talking on Discord rather than a terminal, and
+had never seen the profile's `SOUL.md`. (The profile's own `~/.claude/CLAUDE.md`
+and the project's `CLAUDE.md`/`AGENTS.md` *did* reach it — `settingSources` is
+`["user","project","local"]`. Everything **Hermes** owns did not.)
+
+**The seam is the adapter's own.** `createSession()` reads
+`params._meta.systemPrompt` and clamps it back to
+`{type:"preset", preset:"claude_code"}`, honouring only `append` — so the
+**object form adds** to Claude Code's own instructions. A bare **string
+replaces** them, deleting Claude Code's tool instructions for the session; that
+is how the pre-ACP direct-CLI experiment failed, and it is why
+`agent/claude_acp_system_prompt.py::system_prompt_meta()` is the only thing that
+builds the field. `session/load` honours it too (`loadSession` →
+`getOrCreateSession` → `createSession({..., _meta}, {resume})`), which is why it
+is re-sent on a rebind exactly as the roots and the mode are.
+
+**Curated, not verbatim — the default is `hermes`.** Shipping
+`agent._cached_system_prompt` as-is would carry `MEMORY_GUIDANCE` /
+`SKILLS_GUIDANCE` / `SESSION_SEARCH_GUIDANCE` / `STEER_CHANNEL_NOTE` and the
+skills index, every one of which instructs the model to call a **Hermes tool
+that does not exist in this session** — Packet 5C's tool-vocabulary hazard, an
+order of magnitude harder. It would also carry a `Model: claude-code` /
+`Provider: claude-code-acp` line that is actively false here, and the
+AGENTS.md/CLAUDE.md the adapter already loads through its own path. So the
+default set is: identity/SOUL, environment hints, active profile, platform hint,
+the caller's `system_message`, the memory snapshot, USER.md, and the external
+memory block — plus a frozen preamble that states the precedence (identity ←
+Hermes, tool usage ← Claude Code) and a vocabulary note rendered from
+`HERMES_TO_CLAUDE_TOOLS`. `mode: full` is the opt-in for the verbatim prompt and
+accepts the risk; `mode: soul` is identity only; `mode: off` is byte-identical
+to pre-packet behaviour.
+
+**Sent once per session, never per turn.** `ClaudeAcpSession._connect()` is the
+only caller, and turns 2..N return early from it — so `session/prompt` still
+carries the user's turn alone. That is structural, not conventional. The
+composition is memoized per `ClaudeAcpSession` object, so an idle-eviction
+respawn 30 minutes later re-sends the *same* bytes rather than whatever SOUL.md
+says by then.
+
+**`matches()` is deliberately unchanged.** A changed `SOUL.md` or
+`system_prompt` key takes effect at the **next connect** — the skills-bridge
+rule, not the `permission_mode` rule. The posture is a security property worth
+retiring a healthy adapter for; an identity blob is not, and a rebuild costs the
+Claude-side session and its prompt cache. Stated as a decision and asserted in a
+test so it does not read as an omission.
+
+**Fail-open, and never a turn.** A config read that explodes, a section source
+that raises, a provider fault — each costs one WARNING and a session created
+exactly as it is created today. An identity blob must never cost a user their
+message.
+
+**Truthfulness.** There is no capability for "the agent honoured
+`_meta.systemPrompt`", and `model.claude_code_acp.command` can point at any ACP
+agent. So every name says **sent**, never *applied*:
+`sent_system_prompt_digest`, `system_prompt_sha256`,
+`claude_acp_system_prompt_digest()`, and the connect line
+`"Claude Code ACP: sent the Hermes operating context (mode=…, N chars,
+sha256=…)"`. The one *observable* proof runs in CI against the fake adapter
+(`FAKE_ACP_ECHO_SYSTEM_PROMPT=1`, which echoes a digest of what it **received**),
+so the assertion is about receipt rather than about a params dict Hermes wrote.
+
+**Privacy.** SOUL.md, USER.md and the memory snapshot are Hermes-owned personal
+context, and they now reach the same endpoint that already receives every
+message of the conversation — no new peer, no new credential, no new file, no
+widening of roots / permission mode / approval floor. The class of content is
+new, though, so `soul` and `off` exist and are one word each, and `sections:`
+gives per-block control. **Nothing is scrubbed on the way out** — this is
+user-authored configuration, the same class as the user's own message text, and
+redacting it would mangle a SOUL.md and break the byte-stability the digest
+depends on. **Logs and displays carry the digest and the char count only, never
+the text**, and a test asserts a planted SOUL marker appears in the sent append
+and in no log record.
+
+**Config schema.** One new key tree, no `.env` mirror, no `HERMES_*` var, no
+`DEFAULT_CONFIG` entry, no `_config_version` bump:
+
+```yaml
+model:
+  claude_code_acp:
+    system_prompt:
+      mode: hermes        # off | soul | hermes (DEFAULT) | full
+      sections: []        # [] = the mode's default set. Otherwise an explicit
+                          # allow-list from: identity, environment, profile,
+                          # platform, caller_instructions, memory, user_profile,
+                          # external_memory, skills_index, context_files,
+                          # coding, tool_guidance
+      max_chars: 24000    # clamped to [1000, 120000]
+```
+
+Takes effect at the **next connect**. Unlike `permission_mode`, no value here
+can widen a security boundary — every value only changes what *text* is sent
+into a session whose posture, roots and approval gate are decided elsewhere. The
+direction that matters is privacy, and `soul`/`off` are the narrow values. Read
+it together with `permission_mode` and `skills.bridge`: `auto` + `link` +
+`full` is the widest posture in this runtime.
+
+| Concern | Where | What |
+|---|---|---|
+| Policy + composition | new `agent/claude_acp_system_prompt.py` | `CONFIG_KEYS`, `MODES`, `SECTIONS`, `MODE_SECTIONS`, `DROP_ORDER`, `PREAMBLE`; `configured_system_prompt()` (never raises, never validates); `resolve_system_prompt_config(raw)` — the whole policy in one pure function; `compose_system_prompt()`, `compose_for_agent()` (fail-open), `system_prompt_meta()` (the object form, in one place), `prompt_digest()`, `vocabulary_note()`, `describe_composition()` |
+| Prompt-builder extractions | `agent/system_prompt.py` | `prompt_context_length()`, `build_identity_block()`, `build_active_profile_hint()`, `resolve_platform_hint_block()` — pure moves, so the composer reuses the canonical logic instead of forking it |
+| Wire | `agent/transports/claude_acp.py` | `session_new(..., system_prompt=)` and `session_load(..., system_prompt=)`; merged into `_meta` rather than assigned, so a future second consumer of that envelope is not overwritten |
+| Session | `agent/claude_acp_session.py` | ctor `system_prompt_provider=`; `_compose_system_prompt()` (memoized, including the `None` answer); `_record_system_prompt()`; `sent_system_prompt_digest`. `matches()` unchanged |
+| Binding | `agent/claude_acp_binding.py` | `bind(..., system_prompt_sha256, system_prompt_mode)` — two optional keys in the existing `claude_acp` dict; the **digest**, never the text |
+| Runtime wiring | `agent/claude_code_runtime.py` | `_get_or_create_session(..., system_prompt_provider=lambda: compose_for_agent(agent))`; `claude_acp_system_prompt_text()` / `claude_acp_system_prompt_digest()` accessors |
+| Caller instructions | `agent/turn_context.py` | one assignment, `agent._active_system_message = system_message`, beside the existing prompt build — without it a cron job's or a delegation's instruction is silently dropped on this provider alone. Zero behavioural change elsewhere |
+
+**Bounding.** `max_chars` drops **whole sections** from a fixed order
+(`tool_guidance`, `coding`, `context_files`, `skills_index`, `external_memory`,
+`memory`, `user_profile`, `caller_instructions`, `platform`, `profile`,
+`environment`) — never `identity`, never the preamble — naming each drop in the
+text and in one WARNING. Composing twice yields identical bytes, which is what
+makes the digest meaningful.
+
+**Acceptance checks.**
+1. The active profile's SOUL.md reaches `session_new_params[0]._meta.systemPrompt.append`,
+   in the object form with `preset: "claude_code"` intact.
+2. The agent side *receives* it: with `FAKE_ACP_ECHO_SYSTEM_PROMPT=1` the reply
+   carries `sysprompt[<sha8>:<chars>]` matching the accessor's digest.
+3. Three turns ⇒ one `session/new`, one append, zero replays; no
+   `session/prompt` block carries the marker or an `_meta`.
+4. A rebind after an adapter kill re-sends **byte-identical** bytes on
+   `session/load`, against a freshly spawned adapter (the adapter's session
+   fingerprint is `{cwd, mcpServers}` and does **not** include `_meta`, so a load
+   into a live in-process session would silently ignore a changed prompt).
+5. Editing SOUL.md mid-session changes nothing: the memo holds, no second
+   `session/new`, the digest does not move.
+6. `mode: off` sends no `_meta` and the turn completes.
+7. The binding carries `system_prompt_sha256` + `system_prompt_mode` and nothing
+   else new; the digest equals the sha256 of the text the accessor returns.
+8. A composition fault ⇒ no `_meta`, one WARNING, the turn completes.
+9. A planted SOUL marker is in the sent append and in **no** log record.
+10. Two `HERMES_HOME`s with different SOULs produce different appends, with no
+    `Path.home()` on the path.
+11. The transcript and role alternation are identical with the context on and
+    off, and `agent_persisted` is unchanged.
+
+**Test seams.** `resolve_system_prompt_config()`, `compose_system_prompt()`,
+`system_prompt_meta()`, `prompt_digest()`, `vocabulary_note()`,
+`compose_for_agent()`; `ClaudeAcpSession.sent_system_prompt_digest`;
+`claude_acp_system_prompt_text/digest()`; the fake adapter's
+`FAKE_ACP_ECHO_SYSTEM_PROMPT` echo and its existing `session_new_params` /
+`session_load_params` capture. New file
+`tests/agent/test_claude_code_system_prompt.py` (78 tests: 67 pure, 11 driving a
+REAL fake-adapter subprocess over real stdio). Unlike the skills bridge,
+**nothing here touches `HOME`** — the composer reads `get_hermes_home()` only.
+
+**Deferred (not this packet).** A `/system-prompt` command or any user-facing
+surface for this. `excludeDynamicSections`. Backfilling the append into sessions
+that already ran. Sending Hermes *tool schemas* to the adapter — the plan already
+answers who owns the tool loop: Claude Code does. And the one thing CI cannot
+prove, which stays a **manual check on adapter version bumps**: that the text
+reaches the *model*, not merely the adapter. `_meta.systemPrompt` was confirmed
+to pass adapter 0.66.0's params handling unchanged (`initialize` + two
+`session/new`, same response shape as the control, no stderr) — but that is the
+wire, not the model, and closing it costs one real prompt.
 
 ---
 
